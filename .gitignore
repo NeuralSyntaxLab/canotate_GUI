@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+.vscode/
+.idea/
+
+# Written by launch.py once it finds a working interpreter. Machine-specific,
+# so it stays out of the repo — launcher.cfg.example documents the format.
+launcher.cfg
+
+# Annotation output and audio data belong with the recordings, not in here.
+*.wav
+*_annotation*.json

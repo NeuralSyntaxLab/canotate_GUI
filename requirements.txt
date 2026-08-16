@@ -1,0 +1,23 @@
+# Cannotate — annotation tool dependencies.
+#
+# Required: the GUI will not start without these.
+numpy>=1.20.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+soundfile>=0.10.0
+sounddevice>=0.4.0
+scikit-image>=0.18.0   # colors.py needs this for Lab distances
+                       # (opencv-python works instead, if you already have it)
+#
+# tkinter is also required but is NOT a pip package — it ships with Python.
+# macOS:   install Python from python.org, or `brew install python-tk`
+# Windows: re-run the Python installer and tick "tcl/tk and IDLE"
+# Linux:   apt install python3-tk
+
+# Optional: the NN-assisted buttons (Run NN Segmentation, Classify 999
+# Segments, Full Auto Annotate). Without these the tool still opens and every
+# manual annotation feature works — the NN controls are simply greyed out.
+torch
+onnxruntime      # only needed for the .onnx segmentation weights
+scikit-learn     # pulled in by the 1D-CNN syllable classifier
+pandas           # ditto

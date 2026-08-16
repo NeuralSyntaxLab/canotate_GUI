@@ -1,0 +1,15 @@
+# Copy this file to launcher.cfg to pin a specific Python interpreter.
+#
+# You normally do not need to. launch.py searches for a suitable interpreter on
+# its own and writes the winner here automatically, so the first launch is the
+# only slow one.
+#
+# Set it by hand when the automatic choice is wrong — for example when several
+# conda environments would work but you want a particular one.
+
+[cannotate]
+# macOS / Linux
+python = /opt/anaconda3/envs/moove_env/bin/python
+
+# Windows
+# python = C:\Users\you\anaconda3\envs\moove_env\python.exe

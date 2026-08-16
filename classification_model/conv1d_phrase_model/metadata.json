@@ -1,0 +1,80 @@
+{
+  "hyperparams": {
+    "learning_rate": 0.0002,
+    "batch_size": 64,
+    "epochs": 5,
+    "weight_decay": 0.0001,
+    "dropout_rate": [
+      0.13,
+      0.4,
+      0.4,
+      0.16
+    ],
+    "kernel_size": [
+      16,
+      8,
+      4,
+      4
+    ],
+    "strides": [
+      1,
+      2,
+      4,
+      2
+    ],
+    "hidden_dim": 32,
+    "leaky_relu_slope": 0.01,
+    "early_stopping_patience": 8,
+    "use_batch_norm": true,
+    "normalize_waveform": true,
+    "normalization_mode": "segment_peak",
+    "normalization_eps": 1e-08,
+    "class_weighting": "balanced",
+    "sample_secs": 0.05,
+    "max_per_class": null,
+    "random_seed": 13
+  },
+  "metadata": {
+    "dataset_pickle_path": "C:\\Projects\\tweetynet_flow\\LBRK219RT\\output\\conv1d_phrase_dataset.pkl",
+    "n_train": 948840,
+    "n_val": 85040,
+    "n_test": 145160,
+    "labels": [
+      "1",
+      "10",
+      "11",
+      "13",
+      "14",
+      "15",
+      "16",
+      "17",
+      "18",
+      "19",
+      "2",
+      "20",
+      "21",
+      "22",
+      "23",
+      "24",
+      "25",
+      "27",
+      "28",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "sample_secs": 0.05,
+    "num_samples": 2205,
+    "sample_rate": 44100,
+    "n_sources": 155,
+    "normalization_config": {
+      "mode": "segment_peak",
+      "eps": 1e-08
+    },
+    "input_num_samples": 2205
+  }
+}
