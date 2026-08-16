@@ -16,15 +16,34 @@ trap 'rm -f "$SCRIPT"' EXIT
 
 # The bundle resolves its own location at runtime rather than baking in an
 # absolute path, so moving or renaming the project folder does not break it.
+#
+# Everything the tool prints goes to cannotate.log (fresh each launch), and a
+# non-zero exit puts the tail of that log in a dialog. An earlier version sent
+# output to /dev/null, which meant a crash showed the user nothing at all --
+# never do that in a launcher whose whole point is that there is no terminal.
 cat > "$SCRIPT" <<'APPLESCRIPT'
 on run
     set bundlePath to POSIX path of (path to me)
     -- path to me is .../<project>/Cannotate.app/ ; the project is its parent
     set projectPath to do shell script "dirname " & quoted form of (text 1 thru -2 of bundlePath)
+    set logPath to projectPath & "/cannotate.log"
+
     try
-        do shell script "cd " & quoted form of projectPath & " && /usr/bin/env python3 launch.py > /dev/null 2>&1 &"
+        -- do shell script gives up after 120s by default; annotation sessions
+        -- run far longer than that, so the timeout has to be raised.
+        with timeout of 86400 seconds
+            do shell script "cd " & quoted form of projectPath & ¬
+                " && /usr/bin/env python3 launch.py > " & quoted form of logPath & " 2>&1"
+        end timeout
     on error errMsg
-        display dialog "Cannotate could not start:" & return & return & errMsg ¬
+        set logTail to ""
+        try
+            set logTail to do shell script "tail -n 25 " & quoted form of logPath
+        end try
+        if logTail is "" then set logTail to errMsg
+        display dialog "Cannotate stopped with an error." & return & return & ¬
+            logTail & return & return & ¬
+            "Full log: " & logPath ¬
             buttons {"OK"} default button "OK" with icon stop
     end try
 end run
@@ -34,3 +53,4 @@ rm -rf "$APP"
 osacompile -o "$APP" "$SCRIPT"
 echo "Built $APP"
 echo "Double-click it in Finder to launch Cannotate without a Terminal window."
+echo "Output goes to cannotate.log; errors also appear in a dialog."

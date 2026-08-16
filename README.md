@@ -104,13 +104,28 @@ The syllable classifier is separate — it lives in
 `classification_model/conv1d_phrase_model/` and is chosen with the
 **Classifier model** box in the GUI.
 
+## Pick one environment and stay in it
+
+The tool caches syllable templates next to your annotation JSON
+(`*.templates_cache.pkl`). Those caches are pickles, and pickles are not
+portable across NumPy major versions: a cache written under NumPy 2.x cannot be
+read under NumPy 1.x. An unreadable cache is handled gracefully — it is ignored
+and rebuilt — but rebuilding a large dataset takes about a minute, and the
+rebuild overwrites the cache, so alternating between environments means paying
+that cost every time.
+
+If you have several usable conda environments, pin one in `launcher.cfg` so
+this never comes up.
+
 ## Checking the install
 
 ```
-python smoke_test.py
+python smoke_test.py                  # is this project still self-contained?
+python tests/test_templates_cache.py  # can a bad cache still break startup?
 ```
 
-This verifies the GUI imports, that no module is secretly loading from the old
-project, that the vendored subset has not regrown its training dependencies,
-and that the model files are present. Run it after moving the project or
-changing anything under `bird_song_detector/`.
+`smoke_test.py` verifies the GUI imports, that no module is secretly loading
+from the old project, that the vendored subset has not regrown its training
+dependencies, that the model files are present, and that the viewer builds its
+widgets. Run it after moving the project or changing anything under
+`bird_song_detector/`.

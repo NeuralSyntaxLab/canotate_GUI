@@ -12,3 +12,6 @@ launcher.cfg
 # Annotation output and audio data belong with the recordings, not in here.
 *.wav
 *_annotation*.json
+
+# Written by the .app / launcher; fresh each run.
+cannotate.log

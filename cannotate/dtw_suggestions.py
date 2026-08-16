@@ -429,7 +429,17 @@ def _load_templates_cache(cache_path, expected_fingerprint):
     try:
         with open(cache_path, "rb") as f:
             blob = pickle.load(f)
-    except (OSError, pickle.UnpicklingError, EOFError, ValueError):
+    except FileNotFoundError:
+        return None  # ordinary first run: nothing cached yet, nothing to report
+    except Exception as e:
+        # Deliberately broad. Unpickling runs arbitrary reconstruction code, so
+        # the failure modes are open-ended -- a cache written under NumPy 2.x
+        # raises ModuleNotFoundError('numpy._core') when read under NumPy 1.x,
+        # which the previous OSError/UnpicklingError/EOFError/ValueError list
+        # let through, crashing the GUI during startup. Every failure here is
+        # recoverable by rebuilding, so none of them should be fatal.
+        print(f"Ignoring unreadable template cache {cache_path}: "
+              f"{type(e).__name__}: {e}")
         return None
     if not isinstance(blob, dict):
         return None
