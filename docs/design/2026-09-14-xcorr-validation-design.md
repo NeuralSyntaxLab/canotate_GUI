@@ -1,6 +1,6 @@
 # Cross-correlation validation sandbox — design
 
-Status: proposed
+Status: implemented — see `sandbox/xcorr/` and the Results section
 Date: 2026-09-14
 
 ## Goal
@@ -31,7 +31,11 @@ Those need different scores and different reductions. They are noted in
 
 - 282 files across 7 dates, **all `human_verified: true`**
 - phrase-level segments (a segment is a run of renditions, not one syllable)
-- labels in scope: 4 (n=384), 5 (n=331), 6 (n=335)
+- labels in scope: 4 (n=384), 5 (n=331), 6 (n=335), plus 9 (n=219),
+  10 (n=359), 15 (n=300), 16 (n=302) — added because duration cannot separate
+  them (9 vs 10 differ by 50 ms with ~100 ms spread; 6, 15 and 16 all sit near
+  1.8 s).  A `XCORR_LABELS=all` mode widens this to every label with >= 30
+  instances, which is the honest test.
 - degenerate-short segments are negligible here: 3 / 0 / 0 under 100 ms
 
 Audio root: `/Volumes/Extreme Pro/LBRK219RT`, one directory per date.
@@ -45,7 +49,8 @@ the confusion matrix would look good for the wrong reason.
 ## Decision: timing is not a feature
 
 Phrase duration alone classifies 4/5/6 at **81.5%** accuracy (leave-one-out
-Gaussian; 194 errors in 1050; 126 of them the 4↔5 pair).
+Gaussian; 194 errors in 1050; 126 of them the 4↔5 pair).  Across the seven
+labels in scope it falls to **52.6%**, and across all 17 labels to **23.7%**.
 
 Duration is nevertheless **excluded from the score**, by decision: at correction
 time the segment boundaries are themselves the suspect quantity, so duration is
@@ -241,6 +246,45 @@ human must adjudicate and the figure is how they do it.
 | minimum phrase | `n >= 3m` | else "insufficient support" |
 | split | by date | by-file reported as robustness check |
 
+## Results
+
+Measured with templates and test phrases from disjoint recording dates, over
+human-verified annotations.  Full detail in `sandbox/xcorr/README.md`.
+
+| run | labels | accuracy |
+|---|---|---|
+| peak ZNCC | 7 | 100.0% (0 / 788) |
+| peak ZNCC | **17** | **95.6%** (48 / 1102) |
+| peak ZNCC, file split | 17 | 95.7% |
+| peak ZNCC, 3 templates | 17 | 95.9% |
+| peak ZNCC + PSR tie-break | 17 | 96.5% |
+| duration only (context) | 17 | 23.7% |
+| shuffled templates (control) | 17 | 0.0% |
+
+Against the four questions below: (1) yes, by a wide margin, and without using
+duration; (2) yes — the 17-label margin histogram is bimodal with a valley near
++0.15 and 4.4% negative margins; (3) yes, alternate templates win 656 of 1102
+cases, so within-label variation is real, though exploiting it buys only +0.3
+points; (4) the dominant error, 3→26, is a method error with an identifiable
+cause, described next.
+
+### Peak ZNCC rewards the least specific template
+
+The one finding that contradicts the design as written.  A label-3 rendition is
+an onset transient followed by a sustained harmonic stack; template 26 is only
+a sustained stack — a strict **subset** of what a label-3 phrase contains — so
+it wins on peak (0.958 vs 0.761) despite being the wrong syllable.
+
+PSR detects this (1.3 against template 3's 2.9: the generic template matches at
+many lags, so its peak does not stand out), which is a point in favour of
+computing the surface rather than an aligned scalar.  But PSR cannot be
+promoted to the primary statistic — ranking by it alone gives **0.4%**, since
+its scale tracks template type more than match quality.  As a near-tie breaker
+it trades 3→26 (26 cases down to 11) against 18→1 (14 up to 18) for a net +0.9
+points that is unstable across the threshold, i.e. within noise.  It ships as
+an off-by-default option; the real fix is likely a template *selected for
+specificity* rather than a cleverer scalar.
+
 ## Success criteria
 
 The sandbox has done its job when it can answer:
@@ -267,8 +311,11 @@ A negative answer is a successful outcome. The point is to find out cheaply.
 | One global frequency band handicaps some labels | **resolved** — per-label band |
 | Bimodal renditions break a single medoid | **mitigated** — top-3 switch measures it |
 | Session effects inflate accuracy | **mitigated** — date-level split, file-level as check |
-| 4/5/6 may be too easy to be informative | **open** — 4↔6 already near-solved by duration; the experiment rests on 4↔5 |
-| Cost on the full corpus | **open** — sandbox is 3 labels; FFT-based ZNCC is the mitigation, unmeasured |
+| 4/5/6 may be too easy to be informative | **confirmed** — a closed set of 7 gives 100%; only the 17-label number is meaningful |
+| Session effects inflate accuracy | **measured** — date split 95.6%, file split 95.7%; no session effect |
+| Bimodal renditions break a single medoid | **measured** — alternates win 656/1102, but worth only +0.3 points |
+| Peak ZNCC favours non-specific templates | **new, open** — the dominant residual error; see Results |
+| Cost on the full corpus | **partly measured** — 1117 phrases x 17 labels in ~30 s; caching 251 wavs takes ~4 min |
 
 ## Deferred
 
