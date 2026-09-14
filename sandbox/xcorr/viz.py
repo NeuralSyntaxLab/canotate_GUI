@@ -142,15 +142,78 @@ def run(n_cases=12, only_errors=False, split_by=None):
         chosen = (errors + agree)[:n_cases]
 
     os.makedirs(config.FIGURE_DIR, exist_ok=True)
-    for r in chosen:
+    made = []
+    for n, r in enumerate(chosen, 1):
         tag = "err" if r["assigned"] != r["predicted"] else "ok"
         name = (f"{tag}_{r['assigned']}as{r['predicted']}_"
                 f"m{r['margin']:+.3f}_{r['index']}.png")
-        path = os.path.join(config.FIGURE_DIR, name)
-        figure_for_case(patches, r, specs, path)
-        print(f"  {path}")
-    print(f"\n{len(chosen)} figure(s) in {config.FIGURE_DIR} "
-          f"({len(errors)} disagreement(s) in the run)")
+        figure_for_case(patches, r, specs,
+                        os.path.join(config.FIGURE_DIR, name))
+        made.append((name, r))
+        print(f"  [{n}/{len(chosen)}] {name}")
+
+    index = write_index(made, results, len(errors))
+    print(f"\n{len(made)} figure(s); {len(errors)} disagreement(s) in the run")
+    print(f"open {index}")
+    return index
+
+
+def write_index(made, results, n_errors):
+    """One scrollable page over every figure, worst disagreement first.
+
+    Adjudicating a disagreement means looking at it, and forty-eight separate
+    PNGs is not a thing anyone looks at.
+    """
+    rows = []
+    for name, r in made:
+        disagrees = r["assigned"] != r["predicted"]
+        ranked = sorted(r["scores"].items(),
+                        key=lambda kv: -kv[1]["peak"])[:4]
+        scores = " &nbsp; ".join(
+            f"<b>{l}</b>&nbsp;{v['peak']:.3f}"
+            f"<span class=psr>/{v['psr']:.1f}</span>" for l, v in ranked)
+        rows.append(f"""
+  <section class="{'err' if disagrees else 'ok'}">
+    <h2>{'DISAGREES' if disagrees else 'agrees'} &mdash;
+        annotated <b>{r['assigned']}</b>, method says
+        <b>{r['predicted']}</b>, margin {r['margin']:+.3f}</h2>
+    <p class=meta>{r['date']} &nbsp; {r['file_name']} &nbsp;
+       {r['t_start']:.2f}&ndash;{r['t_end']:.2f}s</p>
+    <p class=meta>top peaks (peak/PSR): {scores}</p>
+    <img src="{name}" alt="{name}">
+  </section>""")
+
+    accuracy = results.get("accuracy", float("nan")) * 100
+    html = f"""<!doctype html><meta charset=utf-8>
+<title>xcorr sandbox &mdash; {n_errors} disagreements</title>
+<style>
+ body {{ font: 14px/1.5 -apple-system, system-ui, sans-serif;
+        margin: 0 auto; padding: 24px; max-width: 1500px; color: #1a1a1a; }}
+ h1 {{ font-size: 20px; margin: 0 0 4px; }}
+ .lede {{ color: #555; margin: 0 0 24px; }}
+ section {{ border-top: 1px solid #ddd; padding: 18px 0; }}
+ section.err h2 {{ color: #a01b1b; }}
+ h2 {{ font-size: 15px; font-weight: 600; margin: 0 0 4px; }}
+ .meta {{ color: #666; margin: 2px 0; font-size: 13px;
+          font-variant-numeric: tabular-nums; }}
+ .psr {{ color: #999; }}
+ img {{ width: 100%; height: auto; margin-top: 10px;
+        border: 1px solid #e5e5e5; }}
+</style>
+<h1>Cross-correlation sandbox &mdash; case review</h1>
+<p class=lede>
+  {len(results.get('labels', []))} labels, split by {results['split']['by']},
+  accuracy {accuracy:.1f}%, {n_errors} disagreement(s).
+  Red headings are cases where the method disagrees with the annotator &mdash;
+  each is either an annotation error or a method error, and only looking
+  tells you which.
+</p>
+{''.join(rows)}
+"""
+    path = os.path.join(config.FIGURE_DIR, "index.html")
+    with open(path, "w") as fh:
+        fh.write(html)
+    return path
 
 
 if __name__ == "__main__":
@@ -158,5 +221,10 @@ if __name__ == "__main__":
     ap.add_argument("--cases", type=int, default=12)
     ap.add_argument("--only-errors", action="store_true")
     ap.add_argument("--split", choices=["date", "file"], default=None)
+    ap.add_argument("--open", action="store_true", help="open the index")
     args = ap.parse_args()
-    run(n_cases=args.cases, only_errors=args.only_errors, split_by=args.split)
+    index = run(n_cases=args.cases, only_errors=args.only_errors,
+                split_by=args.split)
+    if args.open and index:
+        import subprocess
+        subprocess.run(["open", index], check=False)

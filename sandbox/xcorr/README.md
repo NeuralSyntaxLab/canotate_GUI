@@ -12,11 +12,22 @@ is the piece that graduates into `cannotate/` and fills in
 ## Running it
 
 ```bash
+python run.py --all-labels       # everything, then opens the case-review page
+```
+
+That is cache -> experiment -> figures, about 6 minutes cold.  Re-run with
+`--skip-cache` (~2 min) once the patches exist.  Or drive the stages directly:
+
+```bash
 python cache.py                  # ~4 min; reads the external drive once
-python experiment.py             # ~30 s
-python viz.py --only-errors      # figures for every disagreement
+python experiment.py             # ~100 s
+python viz.py --only-errors --open
 python -m pytest test_scoring.py -q
 ```
+
+`viz.py` writes `figures/index.html`: every rendered case on one scrollable
+page, disagreements first, each with its score vector.  That is the page to
+read — the confusion matrix says how often, the figures say why.
 
 All seven requested labels (4, 5, 6, 9, 10, 15, 16) are the default.  To widen
 to every label with at least 30 instances — which is the honest test, since
@@ -109,10 +120,28 @@ cleverer scalar.
   few lags for a sidelobe) covers ~12% of phrases.  They are still scored and
   still classified correctly; only their PSR is `nan`.
 
+## What the cache holds
+
+`patches.npz` is pre-computed spectrogram patches, not audio: one flat
+`float32` matrix of every phrase concatenated along time (183 frequency rows x
+1.39M columns = 1 GB for 17 labels), plus `offsets` indexing each phrase into
+it, `F` (row frequencies, 258 Hz - 16 kHz), `hop_seconds` (0.002) and the
+provenance of each patch (`date`, `file_name`, `t_start`, `t_end`, `label`).
+
+One flat matrix rather than 1796 arrays because every `npz` member is a
+separate zip entry.  183 rows because the cache is band-limited once at
+250-16000 Hz purely to bound size — the discriminative band is per label, at
+scoring time.
+
+It exists only because reading 251 wavs off the external drive takes ~4 min and
+dominates everything else.  Nothing in it is irreplaceable; `--max-per-label`
+is the size knob.
+
 ## Layout
 
 | file | role |
 |---|---|
+| `run.py` | **start here** — runs every stage and opens the case review |
 | `config.py` | every tunable, and the data paths |
 | `spectro.py` | raw `log1p` two-taper spectrogram (no percentile clip) |
 | `cache.py` | annotations + audio -> `patches.npz`; reads the drive once |
