@@ -63,6 +63,30 @@ def save_picks(picks):
     return PICKS_FILE
 
 
+def most_confused_with(label, split_by=None):
+    """The label most often confused with *label* in the last experiment run.
+
+    Saves having to remember which pair is the problem: the experiment already
+    measured it.  Returns ``None`` when no results exist yet.
+    """
+    split_by = split_by or config.SPLIT_BY
+    path = os.path.join(config.CACHE_DIR, f"results_{split_by}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        records = json.load(fh)["records"]
+    counts = defaultdict(int)
+    for r in records:
+        a, p = r.get("assigned"), r.get("predicted")
+        if a == p:
+            continue
+        if a == label and p is not None:
+            counts[p] += 1
+        elif p == label and a is not None:
+            counts[a] += 1
+    return max(counts, key=counts.get) if counts else None
+
+
 def parse_pick(pick_id):
     """``p41@0.32`` -> (41, 0.32): phrase index and window start in seconds."""
     phrase, _, offset = pick_id.partition("@")
@@ -280,7 +304,9 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--label", type=int)
-    ap.add_argument("--against", type=int)
+    ap.add_argument("--against", type=int,
+                    help="the confusable label; inferred from the last "
+                         "experiment run when omitted")
     ap.add_argument("--phrases", type=int, default=8)
     ap.add_argument("--stride", type=float, default=0.05,
                     help="seconds between candidate windows")
@@ -312,9 +338,19 @@ def main():
               else "No manual picks recorded.")
         return
 
-    if args.against is None:
-        raise SystemExit("--against is required (the confusable label).")
-    path = browse(args.label, args.against, n_phrases=args.phrases,
+    against = args.against
+    if against is None:
+        against = most_confused_with(args.label, args.split)
+        if against is None:
+            raise SystemExit(
+                f"--against not given and no experiment results to infer it "
+                f"from.\nRun the experiment first:\n"
+                f"    python experiment.py --split {args.split or config.SPLIT_BY}\n"
+                f"or name the confusable label yourself:\n"
+                f"    python pick_template.py --label {args.label} --against N")
+        print(f"[pick] --against not given; label {against} is the one most "
+              f"often confused with {args.label} in the last run")
+    path = browse(args.label, against, n_phrases=args.phrases,
                   stride_seconds=args.stride, split_by=args.split)
     if args.open:
         import subprocess

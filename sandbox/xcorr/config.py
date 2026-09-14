@@ -17,16 +17,17 @@ AUDIO_ROOT = "/Volumes/Extreme Pro/LBRK219RT"
 # Wavs live at <AUDIO_ROOT>/<date>/chop_data/wav/<file_name>.
 WAV_SUBDIR = os.path.join("chop_data", "wav")
 
-# Written by cache.py / templates.py, read by everything else.  Kept out of
-# the repo: these are large and reproducible.
-CACHE_DIR = os.environ.get(
+# Written by cache.py / templates.py, read by everything else.  Kept out of the
+# repo (large, and reproducible) but in a *stable* place: a session scratchpad
+# or /tmp is wiped on reboot, and nobody can retype the path.
+#
+# The label set is part of the directory name, automatically.  Sharing one
+# cache between label sets would silently score phrases against templates for
+# labels the run does not contain, so the separation must not depend on the
+# caller remembering to pass a different path.
+_CACHE_ROOT = os.environ.get(
     "XCORR_CACHE_DIR",
-    "/private/tmp/claude-501/-Users-nitzankarby-Desktop-masters-yarden-cohen-"
-    "dev-cannotate/8084d949-d156-4331-b7f9-c1fbcd12ad30/scratchpad/xcorr")
-
-PATCHES_NPZ = os.path.join(CACHE_DIR, "patches.npz")
-TEMPLATES_NPZ = os.path.join(CACHE_DIR, "templates.npz")
-FIGURE_DIR = os.path.join(CACHE_DIR, "figures")
+    os.path.expanduser("~/.cache/cannotate-xcorr"))
 
 # ── Labels under test ────────────────────────────────────────────────
 #
@@ -46,6 +47,18 @@ if os.environ.get("XCORR_LABELS"):
 
 # When LABELS is None, keep every label with at least this many instances.
 MIN_INSTANCES_PER_LABEL = 30
+
+if os.environ.get("XCORR_CACHE_DIR"):
+    CACHE_DIR = _CACHE_ROOT                     # explicit path wins, as given
+elif LABELS is None:
+    CACHE_DIR = os.path.join(_CACHE_ROOT, "all")
+else:
+    CACHE_DIR = os.path.join(_CACHE_ROOT,
+                             "-".join(str(l) for l in sorted(LABELS)))
+
+PATCHES_NPZ = os.path.join(CACHE_DIR, "patches.npz")
+TEMPLATES_NPZ = os.path.join(CACHE_DIR, "templates.npz")
+FIGURE_DIR = os.path.join(CACHE_DIR, "figures")
 
 # ── Spectrogram ──────────────────────────────────────────────────────
 #

@@ -35,9 +35,14 @@ real error correction chooses among all of a bird's syllable types rather than
 a hand-picked few:
 
 ```bash
-export XCORR_LABELS=all XCORR_CACHE_DIR=/some/other/dir
+export XCORR_LABELS=all
 python cache.py --max-per-label 120 && python experiment.py
 ```
+
+The cache lives in `~/.cache/cannotate-xcorr/<label set>` and the label set is
+part of the path automatically, so switching sets never reuses the wrong cache
+and no `XCORR_CACHE_DIR` is needed.  Set that variable only to put the cache
+somewhere else entirely.
 
 Controls (each writes to its own results file, never the real one):
 
@@ -260,10 +265,12 @@ made on evidence rather than by eye alone:
 | `gap` | `self - other` — how *specific* the window is | maximise |
 
 ```bash
-python pick_template.py --label 3 --against 26 --open   # browse candidates
+export XCORR_LABELS=all              # labels 3 and 26 only exist in this set
+python pick_template.py --label 3 --open     # --against inferred from the
+python pick_template.py --label 26 --open    # last experiment run
 python pick_template.py --set 3=p1552@0.45 26=p974@1.30
-python experiment.py --split date                       # see the effect
-python pick_template.py --clear 3 26                    # revert
+python experiment.py --split date            # see the effect
+python pick_template.py --clear 3 26         # revert
 ```
 
 Candidates are drawn **only from the template split**: hand-picking a window

@@ -188,11 +188,24 @@ class Patches:
 
     def __init__(self, path=None):
         path = path or config.PATCHES_NPZ
+        data_path = os.path.splitext(path)[0] + "_data.npy"
+        if not os.path.exists(data_path):
+            labels = ("all" if config.LABELS is None
+                      else ",".join(str(l) for l in config.LABELS))
+            raise SystemExit(
+                f"No patch cache at\n    {os.path.dirname(path)}\n\n"
+                f"Build it first (reads the audio once, ~4 min):\n"
+                f"    python cache.py"
+                + ("" if config.LABELS is not None
+                   else " --max-per-label 120")
+                + f"\n\nThe cache is per label set; this one is for "
+                f"labels: {labels}\n"
+                f"Set XCORR_LABELS to change the set "
+                f"(e.g. XCORR_LABELS=all, or XCORR_LABELS=3,26).")
         # Mapped, not loaded: the sandbox reads a few hundred columns at a
         # time out of a multi-gigabyte array, so holding it resident is pure
         # waste and, on a smaller machine, fatal.
-        self.data = np.load(os.path.splitext(path)[0] + "_data.npy",
-                            mmap_mode="r")
+        self.data = np.load(data_path, mmap_mode="r")
         with np.load(path, allow_pickle=False) as z:
             self.offsets = z["offsets"]
             self.F = z["F"]
