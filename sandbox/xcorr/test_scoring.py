@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from scoring import (zncc_surface, zncc_surface_reference, peak_psr,
-                     band_limit, modulation_band, decide)
+                     band_limit, modulation_band, decide, TemplateBank)
 
 
 def test_matches_direct_implementation_on_random_input():
@@ -127,3 +127,44 @@ def test_decide_returns_argmax_and_signed_margin():
     assert decide(scores, assigned_label=5) == (5, pytest.approx(0.19))
     predicted, margin = decide(scores, assigned_label=6)
     assert predicted == 5 and margin == pytest.approx(-0.19)
+
+
+def test_template_bank_matches_the_single_surface_path():
+    """The production path must produce the same numbers as the simple one,
+    or the sandbox's measured accuracy does not transfer to it."""
+    rng = np.random.default_rng(10)
+    phrase = rng.gamma(2.0, 1.0, size=(30, 400))
+    bank_input = {
+        4: [rng.gamma(2.0, 1.0, size=(30, 50))],
+        5: [rng.gamma(2.0, 1.0, size=(30, 50)),
+            rng.gamma(2.0, 1.0, size=(30, 37))],
+    }
+    bank = TemplateBank(bank_input)
+    surfaces = bank.surfaces(phrase)
+    for label, stack in bank_input.items():
+        for k, template in enumerate(stack):
+            np.testing.assert_allclose(surfaces[label][k],
+                                       zncc_surface(phrase, template),
+                                       atol=1e-8)
+
+
+def test_template_bank_reuses_its_transform_across_phrases():
+    """Templates are transformed once per FFT length, not once per phrase."""
+    rng = np.random.default_rng(11)
+    bank = TemplateBank({1: [rng.normal(size=(12, 20))]})
+    phrase = rng.normal(size=(12, 200))
+    bank.surfaces(phrase)
+    first = bank._spectra[1][0]
+    bank.surfaces(rng.normal(size=(12, 200)))
+    assert bank._spectra[1][0] is first
+
+
+def test_template_bank_marks_templates_longer_than_the_phrase():
+    rng = np.random.default_rng(12)
+    bank = TemplateBank({1: [rng.normal(size=(8, 60))]})
+    assert bank.surfaces(rng.normal(size=(8, 30)))[1] == [None]
+
+
+def test_template_bank_rejects_mixed_frequency_bands():
+    with pytest.raises(ValueError):
+        TemplateBank({1: [np.ones((8, 10))], 2: [np.ones((9, 10))]})

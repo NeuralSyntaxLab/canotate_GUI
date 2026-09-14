@@ -14,6 +14,7 @@ than on a pre-aligned pair:
   of a surface and is meaningless for a single aligned score.
 """
 import numpy as np
+from scipy import fft
 from scipy.signal import fftconvolve
 
 
@@ -119,6 +120,104 @@ def zncc_surface(phrase, template):
     nonzero = denominator > 0
     surface[nonzero] = numerator[nonzero] / denominator[nonzero]
     return surface
+
+
+# ── Many templates against one phrase (the production path) ──────────
+
+class TemplateBank:
+    """Templates pre-transformed for repeated scoring against many phrases.
+
+    Scoring one phrase against every label recomputes the *phrase's* transform
+    once instead of once per label, and never recomputes the templates' at all.
+    That is the whole reason this class exists rather than a loop over
+    :func:`zncc_surface`.
+
+    It also drops the 2-D convolution used by :func:`zncc_surface`, which pads
+    the frequency axis to ``2*n_freq - 1`` rows and then keeps a single one.
+    Correlating along time only and summing over frequency in the frequency
+    domain computes exactly the same numbers without that waste.
+
+    All templates must share a frequency band (so they share the phrase's
+    transform).  They may differ in length; each length gets its own denominator.
+    """
+
+    def __init__(self, templates_by_label):
+        self.labels = list(templates_by_label)
+        self.templates = templates_by_label
+        self.n_freq = None
+        for label, stack in templates_by_label.items():
+            for template in stack:
+                if self.n_freq is None:
+                    self.n_freq = template.shape[0]
+                elif template.shape[0] != self.n_freq:
+                    raise ValueError(
+                        "TemplateBank requires one shared frequency band "
+                        f"({self.n_freq} vs {template.shape[0]} bins).")
+        self._centred = {
+            label: [t - t.mean() for t in stack]
+            for label, stack in templates_by_label.items()}
+        self._norm = {
+            label: [float(np.sqrt((t ** 2).sum())) for t in stack]
+            for label, stack in self._centred.items()}
+        self.max_cols = max(t.shape[1] for stack in self._centred.values()
+                            for t in stack)
+        self._cache_len = None
+        self._spectra = {}
+
+    def _prepare(self, length):
+        """Transform every template at FFT length *length*, once."""
+        if self._cache_len == length:
+            return
+        self._spectra = {
+            label: [np.conj(fft.rfft(t, n=length, axis=1))
+                    for t in stack]
+            for label, stack in self._centred.items()}
+        self._cache_len = length
+
+    def surfaces(self, phrase):
+        """``{label: [surface per template]}`` for one phrase.
+
+        The phrase is transformed once here and reused for every label, which
+        is where the speed comes from.
+        """
+        phrase = np.asarray(phrase, dtype=np.float64)
+        if phrase.shape[0] != self.n_freq:
+            raise ValueError(f"Phrase has {phrase.shape[0]} frequency bins, "
+                             f"templates have {self.n_freq}.")
+        n = phrase.shape[1]
+        length = fft.next_fast_len(n + self.max_cols - 1)
+        self._prepare(length)
+        phrase_spectrum = fft.rfft(phrase, n=length, axis=1)
+
+        # Running sums for the query-window standard deviation, shared across
+        # every template of a given length.
+        cs = np.concatenate(([0.0], np.cumsum(phrase.sum(axis=0))))
+        cq = np.concatenate(([0.0], np.cumsum((phrase ** 2).sum(axis=0))))
+        denominators = {}
+
+        out = {}
+        for label in self.labels:
+            surfaces = []
+            for k, spectrum in enumerate(self._spectra[label]):
+                m = self._centred[label][k].shape[1]
+                if n < m:
+                    surfaces.append(None)
+                    continue
+                if m not in denominators:
+                    window_sum = cs[m:] - cs[:-m]
+                    window_sq = cq[m:] - cq[:-m]
+                    variance = window_sq - window_sum ** 2 / (self.n_freq * m)
+                    np.maximum(variance, 0.0, out=variance)
+                    denominators[m] = np.sqrt(variance)
+                numerator = fft.irfft(
+                    (phrase_spectrum * spectrum).sum(axis=0), n=length)[:n - m + 1]
+                den = denominators[m] * self._norm[label][k]
+                surface = np.zeros_like(numerator)
+                nonzero = den > 0
+                surface[nonzero] = numerator[nonzero] / den[nonzero]
+                surfaces.append(surface)
+            out[label] = surfaces
+        return out
 
 
 def zncc_surface_reference(phrase, template):

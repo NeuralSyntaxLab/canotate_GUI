@@ -120,7 +120,59 @@ cleverer scalar.
   few lags for a sidelobe) covers ~12% of phrases.  They are still scored and
   still classified correctly; only their PSR is `nan`.
 
-## What the cache holds
+## Production: no cache, ~6 min for 3000 songs
+
+`detect.py` is the path meant for a real corpus.  It **does not cache
+anything** — the sandbox caches spectrogram patches only because it re-scores
+the same phrases dozens of times while parameters change.  A production scan
+touches each phrase once, so caching it is pure cost: 3000 songs would be
+roughly 13 GB written and read back for no reuse.  `detect.py` reads a file,
+scores it, and drops it before opening the next; peak memory is one file
+(~30 MB per worker) whatever the corpus size.
+
+The only thing that persists is **`templates.npz`, 0.95 MB**.
+
+```bash
+python detect.py fit  --out templates.npz          # once, on verified data
+python detect.py scan --templates templates.npz \
+                      --annotations corpus.json --out flagged.json
+```
+
+Measured on 282 files (29 s of audio each, 3731 phrases), 4 workers:
+
+| stage | cost | 3000 files, 1 core | 4 workers |
+|---|---|---|---|
+| read + spectrogram | 146 ms/file | 7.3 min | |
+| scoring | 6 ms/phrase | 2.4 min | |
+| **measured end to end** | **8.3-9.3 files/s** | ~9.7 min | **5.4-6.1 min** |
+
+Use **4 workers, not 8**: this machine has 4 performance cores, and 8 workers
+measured *slower* (7.1 vs 8.3 files/s) through contention.  The default is
+`cpu_count() // 2`.
+
+Cost scales with total audio duration, not file count — 3000 longer songs will
+take proportionally longer.
+
+### What made it fit
+
+Two changes, neither of which cost accuracy:
+
+* **One shared frequency band** instead of per-label bands: 95.7% against
+  95.6%, and it lets a phrase's Fourier transform be computed once and reused
+  for every label.
+* **`TemplateBank`, an 11x speedup** (66 ms -> 6 ms per phrase across 17
+  labels).  `zncc_surface` uses a 2-D `fftconvolve`, which pads the *frequency*
+  axis to `2*n_freq - 1` rows and then keeps exactly one of them.  Correlating
+  along time only, summing over frequency in the frequency domain, and sharing
+  both the phrase transform (across labels) and the template transforms
+  (across phrases) computes identical numbers — asserted against
+  `zncc_surface` in `test_scoring.py` — without that waste.
+
+On the 282 verified files the scan flags **80 of 3618 phrases (2.2%)** as
+disagreements.  Phrases whose label has no template are reported as
+`no_template` rather than counted as disagreements.
+
+## What the sandbox cache holds
 
 `patches.npz` is pre-computed spectrogram patches, not audio: one flat
 `float32` matrix of every phrase concatenated along time (183 frequency rows x
@@ -133,9 +185,9 @@ separate zip entry.  183 rows because the cache is band-limited once at
 250-16000 Hz purely to bound size — the discriminative band is per label, at
 scoring time.
 
-It exists only because reading 251 wavs off the external drive takes ~4 min and
-dominates everything else.  Nothing in it is irreplaceable; `--max-per-label`
-is the size knob.
+It exists only because the sandbox re-scores the same phrases repeatedly.  It
+is **not** used in production — see above.  Nothing in it is irreplaceable;
+`--max-per-label` is the size knob.
 
 ## Layout
 
@@ -148,6 +200,7 @@ is the size knob.
 | `templates.py` | 200 ms window per label, chosen by consistency |
 | `scoring.py` | **the core that graduates** — ZNCC surface, PSR, decision |
 | `experiment.py` | splits, confusion matrices, margin histogram, controls |
+| `detect.py` | **production** — streaming scan, no cache, multiprocessing |
 | `viz.py` | per-case figures: phrase, templates, ZNCC surfaces |
 | `test_scoring.py` | ZNCC checked against a brute-force reference |
 
