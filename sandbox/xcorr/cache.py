@@ -155,9 +155,13 @@ def build(max_per_label=None, out_path=None, verbose=True):
     stacked = np.concatenate(patches, axis=1)
     del patches
 
+    # The patch data goes to its own .npy so it can be memory-mapped on read.
+    # A .npz member cannot be mapped, so loading one would pull the whole
+    # gigabyte into RAM to serve patches that are read a few columns at a time.
+    data_path = os.path.splitext(out_path)[0] + "_data.npy"
+    np.save(data_path, stacked)
     np.savez(
         out_path,
-        data=stacked,
         offsets=offsets,
         F=F_band,
         date=np.array([m[0] for m in meta]),
@@ -168,10 +172,12 @@ def build(max_per_label=None, out_path=None, verbose=True):
         hop_seconds=np.array(config.HOP_SECONDS),
     )
     if verbose:
-        size_mb = os.path.getsize(out_path) / 1e6
+        size_mb = (os.path.getsize(out_path)
+                   + os.path.getsize(data_path)) / 1e6
         print(f"[cache] wrote {len(meta)} patches "
               f"({stacked.shape[0]} bins x {stacked.shape[1]} cols, "
-              f"{size_mb:.0f} MB) -> {out_path}")
+              f"{size_mb:.0f} MB) -> {out_path} (+ _data.npy, memory-mapped "
+              f"on read)")
         if skipped:
             print(f"[cache] skipped {len(skipped)}: {skipped[:3]}")
     return out_path
@@ -182,8 +188,12 @@ class Patches:
 
     def __init__(self, path=None):
         path = path or config.PATCHES_NPZ
+        # Mapped, not loaded: the sandbox reads a few hundred columns at a
+        # time out of a multi-gigabyte array, so holding it resident is pure
+        # waste and, on a smaller machine, fatal.
+        self.data = np.load(os.path.splitext(path)[0] + "_data.npy",
+                            mmap_mode="r")
         with np.load(path, allow_pickle=False) as z:
-            self.data = z["data"]
             self.offsets = z["offsets"]
             self.F = z["F"]
             self.date = z["date"]
@@ -201,7 +211,8 @@ class Patches:
         return len(self.label)
 
     def __getitem__(self, i):
-        return self.data[:, self.offsets[i]:self.offsets[i + 1]]
+        # np.asarray materialises just this patch from the mapping.
+        return np.asarray(self.data[:, self.offsets[i]:self.offsets[i + 1]])
 
     def indices_for(self, label):
         return np.where(self.label == label)[0]

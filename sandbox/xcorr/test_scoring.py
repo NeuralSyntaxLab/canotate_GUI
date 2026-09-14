@@ -143,20 +143,49 @@ def test_template_bank_matches_the_single_surface_path():
     surfaces = bank.surfaces(phrase)
     for label, stack in bank_input.items():
         for k, template in enumerate(stack):
+            # The bank caches template spectra as complex64 to bound memory.
+            # Measured against the float64 path on realistic input (133 bins,
+            # 850 columns) the worst error is 2e-8, on ZNCC values near 1 and
+            # margins of 0.1-0.4 -- seven orders of magnitude of headroom.
             np.testing.assert_allclose(surfaces[label][k],
                                        zncc_surface(phrase, template),
-                                       atol=1e-8)
+                                       atol=1e-7)
 
 
-def test_template_bank_reuses_its_transform_across_phrases():
-    """Templates are transformed once per FFT length, not once per phrase."""
+def test_template_bank_reuses_its_transform_across_DIFFERENT_lengths():
+    """The cache must survive phrases of differing length.
+
+    Regression test.  The first version keyed the cache on the exact FFT
+    length, so real phrases -- which all differ in length -- never hit it and
+    every template was re-transformed per phrase.  With a few hundred
+    templates that allocates hundreds of MB per phrase and takes the machine
+    down.
+    """
     rng = np.random.default_rng(11)
     bank = TemplateBank({1: [rng.normal(size=(12, 20))]})
-    phrase = rng.normal(size=(12, 200))
-    bank.surfaces(phrase)
-    first = bank._spectra[1][0]
     bank.surfaces(rng.normal(size=(12, 200)))
-    assert bank._spectra[1][0] is first
+    assert len(bank._spectra) == 1
+    cached = next(iter(bank._spectra.values()))[1][0]
+    for cols in (201, 233, 199, 150):
+        bank.surfaces(rng.normal(size=(12, cols)))
+    assert len(bank._spectra) == 1, "one bucket should serve all these lengths"
+    assert next(iter(bank._spectra.values()))[1][0] is cached
+
+
+def test_template_bank_bounds_its_cached_buckets():
+    rng = np.random.default_rng(13)
+    bank = TemplateBank({1: [rng.normal(size=(12, 20))]})
+    for cols in (100, 300, 700, 1500, 3000):
+        bank.surfaces(rng.normal(size=(12, cols)))
+    assert len(bank._spectra) <= TemplateBank.MAX_CACHED_BUCKETS
+
+
+def test_template_bank_refuses_to_exhaust_memory():
+    """Rather than taking the machine down, it tells the caller to chunk."""
+    rng = np.random.default_rng(14)
+    bank = TemplateBank({i: [rng.normal(size=(133, 100))] for i in range(300)})
+    with pytest.raises(MemoryError, match="chunk"):
+        bank.surfaces(rng.normal(size=(133, 1000)))
 
 
 def test_template_bank_marks_templates_longer_than_the_phrase():

@@ -15,6 +15,7 @@ where in the rendition cycle each candidate window happened to land.
 Run:  python templates.py [--n-templates 3]
 """
 import argparse
+import json
 import os
 import sys
 
@@ -25,6 +26,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import scoring
 from cache import Patches
+
+
+def _manual_picks():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "manual_templates.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as fh:
+        return json.load(fh)
 
 
 def template_cols(patches, label, indices):
@@ -58,6 +68,23 @@ def select(patches, label, indices, n_candidates=None, n_keep=None,
     rng = rng or np.random.default_rng(config.RANDOM_SEED)
 
     m, seconds = template_cols(patches, label, indices)
+
+    # A hand-picked window overrides the automatic rule entirely.  The centred
+    # 200 ms window maximises consistency, not *specificity*, which is what
+    # produces the 3 -> 26 failure; pick_template.py exists to choose a window
+    # by the latter.
+    manual = _manual_picks().get(str(label))
+    if manual is not None:
+        import pick_template
+        band = config.GLOBAL_BAND or (1000.0, 13000.0)
+        window = pick_template.window_from_pick(patches, manual, m, band)
+        if verbose:
+            print(f"[templates] label {label:>3}: MANUAL pick {manual} "
+                  f"({m} cols, band {band[0]:.0f}-{band[1]:.0f} Hz)")
+        return {"templates": [window], "band": band, "cols": m,
+                "seconds": seconds, "source_index": [], "consistency": [],
+                "candidate_indices": [], "manual": manual}
+
     usable = [i for i in indices if patches[i].shape[1] >= m]
     if len(usable) < 2:
         raise ValueError(f"Label {label}: fewer than 2 phrases reach "

@@ -172,16 +172,47 @@ On the 282 verified files the scan flags **80 of 3618 phrases (2.2%)** as
 disagreements.  Phrases whose label has no template are reported as
 `no_template` rather than counted as disagreements.
 
+## Memory
+
+This bit the author, so it is written down.
+
+`TemplateBank` caches each template's Fourier transform keyed by FFT length.
+The first version keyed on the *exact* length a phrase needed. Real phrases all
+differ in length, so the key never hit and **every template was re-transformed
+for every phrase**. With the 17 production templates that is merely wasteful;
+`pick_template.py` builds a bank of a few hundred candidate windows, so each
+phrase triggered a ~250-500 MB reallocation, dozens of times over, and took the
+machine down.
+
+Three defences now:
+
+* **Lengths are bucketed to powers of two**, so a handful of buckets serve every
+  phrase and the cache actually hits. `test_template_bank_reuses_its_transform_across_DIFFERENT_lengths`
+  is the regression test; the original test compared two phrases of *identical*
+  length and so passed while the bug was live.
+* **`TemplateBank` refuses** to build spectra above `MAX_SPECTRA_BYTES` (256 MB),
+  raising `MemoryError` telling the caller to chunk, rather than trying.
+  `pick_template.py` chunks 32 candidates at a time.
+* **Spectra are `complex64`** and the patch cache is **memory-mapped** rather
+  than loaded. Measured precision cost of `complex64` at realistic scale
+  (133 bins, 850 columns): worst error 2e-8 on ZNCC values near 1, against
+  margins of 0.1-0.4.
+
+If you add a stage that scores many templates at once, chunk it.
+
 ## What the sandbox cache holds
 
-`patches.npz` is pre-computed spectrogram patches, not audio: one flat
+`patches_data.npy` is pre-computed spectrogram patches, not audio: one flat
 `float32` matrix of every phrase concatenated along time (183 frequency rows x
-1.39M columns = 1 GB for 17 labels), plus `offsets` indexing each phrase into
-it, `F` (row frequencies, 258 Hz - 16 kHz), `hop_seconds` (0.002) and the
-provenance of each patch (`date`, `file_name`, `t_start`, `t_end`, `label`).
+1.39M columns = 1 GB for 17 labels).  `patches.npz` beside it holds `offsets`
+indexing each phrase into that matrix, `F` (row frequencies, 258 Hz - 16 kHz),
+`hop_seconds` (0.002) and the provenance of each patch (`date`, `file_name`,
+`t_start`, `t_end`, `label`).
 
-One flat matrix rather than 1796 arrays because every `npz` member is a
-separate zip entry.  183 rows because the cache is band-limited once at
+The data is a separate `.npy` so it can be **memory-mapped**: an `.npz` member
+cannot be, so a single array would pull the whole gigabyte resident to serve
+patches that are read a few hundred columns at a time.  One flat matrix rather
+than 1796 arrays because every `npz` member is a separate zip entry.  183 rows because the cache is band-limited once at
 250-16000 Hz purely to bound size — the discriminative band is per label, at
 scoring time.
 
@@ -201,6 +232,7 @@ is **not** used in production — see above.  Nothing in it is irreplaceable;
 | `scoring.py` | **the core that graduates** — ZNCC surface, PSR, decision |
 | `experiment.py` | splits, confusion matrices, margin histogram, controls |
 | `detect.py` | **production** — streaming scan, no cache, multiprocessing |
+| `pick_template.py` | hand-pick a label's template window, scored for specificity |
 | `viz.py` | per-case figures: phrase, templates, ZNCC surfaces |
 | `test_scoring.py` | ZNCC checked against a brute-force reference |
 
@@ -210,3 +242,40 @@ The corpus used is human-verified throughout, so this measures whether the
 method **agrees with correct labels** — which is the prerequisite.  It does not
 yet show what the method flags on the *unverified* corpus, which is the actual
 error-correction use case and the obvious next step.
+
+## Hand-picking a template
+
+The automatic rule takes a *centred* 200 ms window from the most consistent
+phrase.  It maximises **consistency**, not **specificity** — which is exactly
+what produces the 3 -> 26 failure, where template 26 is a strict subset of what
+a label-3 rendition contains.
+
+`pick_template.py` scores every candidate window two ways so the choice can be
+made on evidence rather than by eye alone:
+
+| | meaning | want |
+|---|---|---|
+| `self` | mean peak ZNCC against other phrases of its own label | high |
+| `other` | mean peak ZNCC against phrases of the confusable label | low |
+| `gap` | `self - other` — how *specific* the window is | maximise |
+
+```bash
+python pick_template.py --label 3 --against 26 --open   # browse candidates
+python pick_template.py --set 3=p1552@0.45 26=p974@1.30
+python experiment.py --split date                       # see the effect
+python pick_template.py --clear 3 26                    # revert
+```
+
+Candidates are drawn **only from the template split**: hand-picking a window
+out of a phrase the experiment later scores would leak the answer into the
+measurement, and the leak would be invisible in the confusion matrix.
+
+Effect of the top-`gap` candidates, 17 labels, date split:
+
+| templates | accuracy | 3<->26 | 1<->18 |
+|---|---|---|---|
+| automatic | 95.6% (48 errors) | 26 | 14 |
+| `3=p1552@0.45`, `26=p974@1.30` | **96.4% (40 errors)** | **17** | 14 |
+
+Picks live in `manual_templates.json`, and `experiment.py` announces them
+loudly when active — a stray pick silently changes every number a run reports.

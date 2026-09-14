@@ -183,6 +183,14 @@ def run(split_by=None, n_templates=None, global_band=None,
 
     labels = [l for l in config.LABELS if l in specs]
 
+    manual = {l: spec["manual"] for l, spec in specs.items() if "manual" in spec}
+    if manual:
+        # Loud, because a stray manual pick silently changes every number the
+        # run reports and is easy to miss in the per-label template lines.
+        print(f"\n*** MANUAL TEMPLATES ACTIVE: {manual} ***")
+        print("*** these override the automatic rule; "
+              "pick_template.py --clear <label> to remove ***")
+
     assigned, predicted, margins = [], [], []
     outcomes = Counter()
     rank_wins = Counter()

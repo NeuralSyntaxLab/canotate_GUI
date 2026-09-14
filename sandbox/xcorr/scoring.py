@@ -139,7 +139,20 @@ class TemplateBank:
 
     All templates must share a frequency band (so they share the phrase's
     transform).  They may differ in length; each length gets its own denominator.
+
+    Transform lengths are **bucketed to powers of two**.  Keying the cache on
+    the exact length needed by each phrase looks tighter but is catastrophic:
+    real phrases all differ in length, so the key never hits and every template
+    is re-transformed for every phrase.  With a few hundred templates that
+    allocates hundreds of megabytes per phrase and will take a machine down.
+    Bucketing turns "once per phrase" into "once per bucket", and there are
+    only a handful of buckets.
     """
+
+    #: Refuse to build a bank whose cached spectra would exceed this, rather
+    #: than exhausting memory.  Callers with many templates should chunk them.
+    MAX_SPECTRA_BYTES = 256 * 1024 ** 2
+    MAX_CACHED_BUCKETS = 3
 
     def __init__(self, templates_by_label):
         self.labels = list(templates_by_label)
@@ -161,18 +174,44 @@ class TemplateBank:
             for label, stack in self._centred.items()}
         self.max_cols = max(t.shape[1] for stack in self._centred.values()
                             for t in stack)
-        self._cache_len = None
+        self.n_templates = sum(len(stack) for stack in self._centred.values())
         self._spectra = {}
+        self._bucket_order = []
+
+    @staticmethod
+    def _bucket(needed):
+        """Round an FFT length up to the next power of two.
+
+        Powers of two are both fast to transform and few in number, which is
+        the point: it is the *number of distinct lengths* that decides how
+        often the template cache is rebuilt.
+        """
+        return 1 << max(4, int(needed - 1).bit_length())
+
+    def estimated_bytes(self, length):
+        """Bytes one bucket of cached template spectra would occupy."""
+        return self.n_templates * self.n_freq * (length // 2 + 1) * 8
 
     def _prepare(self, length):
-        """Transform every template at FFT length *length*, once."""
-        if self._cache_len == length:
+        """Transform every template at FFT length *length*, once per bucket."""
+        if length in self._spectra:
             return
-        self._spectra = {
-            label: [np.conj(fft.rfft(t, n=length, axis=1))
+        budget = self.estimated_bytes(length)
+        if budget > self.MAX_SPECTRA_BYTES:
+            raise MemoryError(
+                f"TemplateBank with {self.n_templates} templates would need "
+                f"{budget / 1e6:.0f} MB of spectra at FFT length {length} "
+                f"(limit {self.MAX_SPECTRA_BYTES / 1e6:.0f} MB). "
+                "Score the templates in chunks.")
+        # complex64 is ample: the inputs are float32 spectrogram values and the
+        # result is divided by a norm of similar magnitude.
+        self._spectra[length] = {
+            label: [np.conj(fft.rfft(t, n=length, axis=1)).astype(np.complex64)
                     for t in stack]
             for label, stack in self._centred.items()}
-        self._cache_len = length
+        self._bucket_order.append(length)
+        while len(self._bucket_order) > self.MAX_CACHED_BUCKETS:
+            del self._spectra[self._bucket_order.pop(0)]
 
     def surfaces(self, phrase):
         """``{label: [surface per template]}`` for one phrase.
@@ -185,9 +224,10 @@ class TemplateBank:
             raise ValueError(f"Phrase has {phrase.shape[0]} frequency bins, "
                              f"templates have {self.n_freq}.")
         n = phrase.shape[1]
-        length = fft.next_fast_len(n + self.max_cols - 1)
+        length = self._bucket(n + self.max_cols - 1)
         self._prepare(length)
-        phrase_spectrum = fft.rfft(phrase, n=length, axis=1)
+        spectra = self._spectra[length]
+        phrase_spectrum = fft.rfft(phrase, n=length, axis=1).astype(np.complex64)
 
         # Running sums for the query-window standard deviation, shared across
         # every template of a given length.
@@ -198,7 +238,7 @@ class TemplateBank:
         out = {}
         for label in self.labels:
             surfaces = []
-            for k, spectrum in enumerate(self._spectra[label]):
+            for k, spectrum in enumerate(spectra[label]):
                 m = self._centred[label][k].shape[1]
                 if n < m:
                     surfaces.append(None)
@@ -210,7 +250,8 @@ class TemplateBank:
                     np.maximum(variance, 0.0, out=variance)
                     denominators[m] = np.sqrt(variance)
                 numerator = fft.irfft(
-                    (phrase_spectrum * spectrum).sum(axis=0), n=length)[:n - m + 1]
+                    (phrase_spectrum * spectrum).sum(axis=0).astype(np.complex128),
+                    n=length)[:n - m + 1]
                 den = denominators[m] * self._norm[label][k]
                 surface = np.zeros_like(numerator)
                 nonzero = den > 0
