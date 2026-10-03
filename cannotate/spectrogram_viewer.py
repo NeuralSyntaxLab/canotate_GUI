@@ -2,7 +2,7 @@
 IntegratedSpectrogramViewer — the main spectrogram annotation window.
 
 This module contains the full viewer class; DTW helpers are delegated to
-``dtw_suggestions`` and utilities to ``cannotate_utils``.
+``spectrograms`` and utilities to ``cannotate_utils``.
 """
 import os
 import re
@@ -28,7 +28,10 @@ from .cannotate_utils import (
     NN_MODEL_ARCHITECTURES, NN_WEIGHTS_DIR,
     ONNX_DEFAULT_WEIGHTS,
 )
-from . import dtw_suggestions as dtw
+from . import spectrograms
+from . import template_store
+from .xcorr_suggestions import SuggestionEngine, TOP_K
+from .onnx_segmentation import OnnxSegmentationModel  # noqa: F401
 
 
 # ── NN imports (optional at top-level) ───────────────────────────────
@@ -49,45 +52,6 @@ else:
     TORCH_IMPORT_ERROR = None
 
 
-class OnnxSegmentationModel:
-    """Wraps an ONNX InferenceSession to look like a PyTorch model.
-
-    Compatible with ``InferenceToAnnotationData.run_inference()``, which calls
-    ``model.eval()``, ``model.to(device)``, and ``model(tensor)`` and then
-    applies ``torch.sigmoid`` on the result.
-
-    The ONNX graph accepts ``[batch, 256]`` float32 and returns raw logits
-    ``[batch, 1]`` — identical contract to the PyTorch ConvMLP.
-    """
-
-    def __init__(self, onnx_path: str):
-        import onnxruntime as ort
-        providers = ["CPUExecutionProvider"]
-        try:
-            available = ort.get_available_providers()
-            for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider"):
-                if p in available:
-                    providers.insert(0, p)
-                    break
-        except Exception:
-            pass
-        self._session = ort.InferenceSession(onnx_path, providers=providers)
-        self._input_name = self._session.get_inputs()[0].name
-
-    def eval(self):
-        return self
-
-    def to(self, device):
-        return self  # onnxruntime selects its own execution provider
-
-    # Annotations are quoted: torch may be None on a machine without the
-    # deep-learning stack, and a bare torch.Tensor would blow up at class
-    # definition time, taking the whole GUI down with it.
-    def __call__(self, x: "torch.Tensor") -> "torch.Tensor":
-        x_np = x.cpu().numpy()
-        outputs = self._session.run(None, {self._input_name: x_np})
-        return torch.from_numpy(outputs[0])
-
 MAX_RATIO = 0.50
 
 # Default location of the trained 1D-CNN syllable-classification model.
@@ -95,6 +59,34 @@ CLASSIFICATION_MODEL_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), os.pardir,
     "classification_model", "conv1d_phrase_model",
 )
+
+
+def _prefix(extra_msg, msg):
+    """Join an optional leading note to a dialog message."""
+    return f"{extra_msg}\n\n{msg}" if extra_msg else msg
+
+
+# The files that define a classification model: the weights, the output-index
+# -> label mapping saved with them, and the input/normalization contract.
+CLASSIFICATION_MODEL_FILES = ("cnn1d_model.pt", "label_encoder.json", "metadata.json")
+
+
+def _clf_model_fingerprint(model_dir):
+    """Identity of the model currently sitting in ``model_dir``.
+
+    Used as the classifier cache key so that replacing a model *in place* -
+    dropping new weights and a new ``label_encoder.json`` into the same folder -
+    is picked up instead of silently reusing the previously loaded model, and
+    with it the previous index -> label mapping.
+    """
+    stamps = []
+    for name in CLASSIFICATION_MODEL_FILES:
+        try:
+            st = os.stat(os.path.join(model_dir, name))
+            stamps.append((name, int(st.st_size), int(st.st_mtime_ns)))
+        except OSError:
+            stamps.append((name, -1, -1))
+    return tuple(stamps)
 
 
 def _is_unlabeled_label(label):
@@ -106,7 +98,7 @@ def _is_unlabeled_label(label):
 
 
 def _write_png_template(annot_id, tmpl, template_dir, palette):
-    """Write ``syllable_{annot_id}.png`` from a template's medoid spectrogram.
+    """Write ``syllable_{annot_id}.png`` from a template's spectrogram.
 
     Overwrites any existing file so the on-disk class template stays in sync
     with the (possibly rebuilt) ``tmpl`` dict.
@@ -135,9 +127,9 @@ def _write_png_template(annot_id, tmpl, template_dir, palette):
 
 
 def _write_wav_template(annot_id, tmpl, template_dir, pad=0.05):
-    """Write ``syllable_{annot_id}.wav`` from a template's medoid audio.
+    """Write ``syllable_{annot_id}.wav`` from a template's source audio.
 
-    Reads the medoid's source wav and re-extracts the annotated segment (plus
+    Reads the wav the template was cut from and re-extracts that window (plus
     padding). Overwrites any existing file.
     """
     src = tmpl.get("source_path")
@@ -164,11 +156,12 @@ def regenerate_disk_templates(templates, template_dir, pad=0.05):
 
     Removes orphaned ``syllable_*.png`` / ``syllable_*.wav`` files for labels
     that no longer exist, and (re)writes the spectrogram (PNG) and audio (WAV)
-    template for every surviving label from its medoid instance.
+    template for every surviving label from the window its template was cut
+    from.
 
     Call this after merging label classes so the class/audio templates on disk
-    reflect the new set of labels. ``templates`` is the dict returned by
-    :func:`build_global_syllable_templates`.
+    reflect the new set of labels. ``templates`` is the display dict returned
+    by :func:`cannotate.template_store.as_display_templates`.
     """
     if not template_dir or not os.path.isdir(template_dir):
         return
@@ -196,7 +189,7 @@ def regenerate_disk_templates(templates, template_dir, pad=0.05):
             except OSError as e:
                 print(f"Could not remove stale template {fname}: {e}")
 
-    # 2) (Re)generate PNG + WAV for every surviving template from its medoid.
+    # 2) (Re)generate PNG + WAV for every surviving template from its source.
     palette = distinguishable_colors(1000)
     for annot_id, tmpl in templates.items():
         if not isinstance(tmpl, dict):
@@ -208,14 +201,10 @@ def regenerate_disk_templates(templates, template_dir, pad=0.05):
 class IntegratedSpectrogramViewer:
     """Full-featured spectrogram viewer / annotator."""
 
-    TEMPLATE_COLS = dtw.TEMPLATE_COLS
-    # Cap on how many appearances of each syllable are loaded to build its
-    # template; the rest of the corpus is never read. See dtw_suggestions.
-    MAX_INSTANCES_PER_LABEL = dtw.MAX_INSTANCES_PER_LABEL
 
     def __init__(self, master, bird_folder=None, annotation_callback=None,
-                 db_data=None, date_to_wavs=None,
-                 global_syllable_templates=None, verified_callback=None):
+                 db_data=None, date_to_wavs=None, template_bank=None,
+                 verified_callback=None, template_refresh_callback=None):
         self.annotation_callback = annotation_callback
         # Called with the new boolean whenever the user toggles "human
         # verified".  The viewer itself never touches the annotation file; the
@@ -231,18 +220,35 @@ class IntegratedSpectrogramViewer:
         self.db_data = db_data
         self.date_to_wavs = date_to_wavs
 
-        # Pre-built global syllable templates
-        if global_syllable_templates is not None:
-            self.syllable_templates = global_syllable_templates
-        else:
-            self.syllable_templates = {}
-
+        # The template bank drives suggestions; ``syllable_templates`` is the
+        # display-shaped view of it the template screens read.  Set through
+        # set_template_bank so a background fit can swap it in later.
         self.bird_folder = bird_folder
+        #: Called instead of refitting inline when the owner of the window has
+        #: its own progress UI for it (the main GUI does).
+        self.template_refresh_callback = template_refresh_callback
+        self.template_bank = None
+        self.suggestion_engine = None
+        self.syllable_templates = {}
+        self._scoring_spectrogram = None
+        self.set_template_bank(template_bank)
+
         if self.bird_folder:
             self.template_dir = os.path.join(self.bird_folder, "syllable_templates")
             os.makedirs(self.template_dir, exist_ok=True)
         else:
             self.template_dir = None
+
+        # ── Top bar: human-verification toggle (also bound to "v") ───
+        # Packed before the figure frame so it stays at the very top of the
+        # window, where it is visible without scrolling past the button rows.
+        top_bar = tk.Frame(self.root)
+        top_bar.pack(fill='x', side=tk.TOP)
+        self.btn_verified = tk.Button(top_bar,
+                                      command=self.toggle_human_verified,
+                                      font=("Arial", 10, "bold"))
+        self.btn_verified.pack(side=tk.LEFT, padx=10, pady=3)
+        self._update_verified_button()
 
         # ── Matplotlib figure ────────────────────────────────
         self.frame = tk.Frame(self.root)
@@ -377,6 +383,7 @@ class IntegratedSpectrogramViewer:
         self.root.bind("g", lambda e: self.activate_auto_suggest_mode())
         self.root.bind("p", lambda e: self.prune_mismatched_labels())
         self.root.bind("v", self.toggle_human_verified)
+        self.root.bind("x", self.accept_suggestions_and_classify)
         self.root.bind("<Up>", lambda e: self.increase_threshold())
         self.root.bind("<Down>", lambda e: self.decrease_threshold())
 
@@ -396,7 +403,9 @@ class IntegratedSpectrogramViewer:
         self.segments = []
         self.segment_start = None
         self.palette = distinguishable_colors(1000)
-        # Cache of loaded SegmentClassifier objects, keyed by model directory.
+        # Cache of loaded SegmentClassifier objects, keyed by model directory
+        # *and* the fingerprint of the files in it, so swapping or replacing a
+        # model never reuses the previous one's label mapping.
         self._segment_classifier_cache = {}
 
         tk.Button(btn_frame2, text="Set Norm Percentiles",
@@ -479,6 +488,11 @@ class IntegratedSpectrogramViewer:
                   bg="#FF6F00", fg="white", state=nn_state,
                   font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=10, pady=3)
 
+        tk.Button(btn_frame5, text="✓ Accept Suggestions + Classify (x)",
+                  command=self.accept_suggestions_and_classify,
+                  bg="#3F51B5", fg="white", state=nn_state,
+                  font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=10, pady=3)
+
         tk.Label(btn_frame5,
                  text="Runs NN segmentation then classification in one step.",
                  fg="gray").pack(side=tk.LEFT, padx=5)
@@ -487,13 +501,6 @@ class IntegratedSpectrogramViewer:
         tk.Checkbutton(btn_frame5, text="Show AI annotations",
                        variable=self.show_ai_var,
                        command=self.update_plots).pack(side=tk.RIGHT, padx=10)
-
-        # Human-verification toggle (press "v" for the same action).
-        self.btn_verified = tk.Button(btn_frame5,
-                                      command=self.toggle_human_verified,
-                                      font=("Arial", 10, "bold"))
-        self.btn_verified.pack(side=tk.RIGHT, padx=10, pady=3)
-        self._update_verified_button()
 
     # ================================================================
     # Human verification flag
@@ -684,8 +691,11 @@ class IntegratedSpectrogramViewer:
         if path:
             self.clf_model_var.set(path)
 
-    def classify_unlabeled_segments(self):
+    def classify_unlabeled_segments(self, extra_msg=None):
         """Label every unlabeled (999) segment with the trained 1D-CNN.
+
+        ``extra_msg`` is prepended to the summary dialogs, so an action that
+        chains into this one can report what it did first.
 
         Segments that already carry a label are left untouched. Short segments
         are classified using a fixed-length window centred on them (the model
@@ -703,7 +713,8 @@ class IntegratedSpectrogramViewer:
         ]
         if not unlabeled_idx:
             messagebox.showinfo(
-                "Classify", "No unlabeled (999) segments to classify.")
+                "Classify",
+                _prefix(extra_msg, "No unlabeled (999) segments to classify."))
             return
 
         model_dir = self.clf_model_var.get().strip()
@@ -732,10 +743,16 @@ class IntegratedSpectrogramViewer:
             return
 
         try:
-            clf = self._segment_classifier_cache.get(model_dir)
+            cache_key = (os.path.normpath(model_dir),
+                         _clf_model_fingerprint(model_dir))
+            clf = self._segment_classifier_cache.get(cache_key)
             if clf is None:
                 clf = SegmentClassifier.load(model_dir, verbose=False)
-                self._segment_classifier_cache[model_dir] = clf
+                # One entry per folder: a replaced model supersedes the old one.
+                for stale in [k for k in self._segment_classifier_cache
+                              if k[0] == cache_key[0]]:
+                    del self._segment_classifier_cache[stale]
+                self._segment_classifier_cache[cache_key] = clf
         except Exception as e:
             messagebox.showerror("Classify", f"Failed to load model:\n{e}")
             return
@@ -801,7 +818,22 @@ class IntegratedSpectrogramViewer:
             msg += (f"\nFilled {n_gap_filled} gap(s) flanked by the same label "
                     f"on both sides.")
         msg += f"\n{n_low_conf} stayed 999 (below confidence {min_conf:g})."
-        messagebox.showinfo("Classify", msg)
+        messagebox.showinfo("Classify", _prefix(extra_msg, msg))
+
+    def accept_suggestions_and_classify(self, event=None):
+        """One-shot "x": accept the entropy suggestions in view, then classify.
+
+        The accepted suggestions carry no label, which
+        :meth:`classify_unlabeled_segments` treats exactly like the 999
+        placeholder, so the classifier picks them up along with any 999
+        segments already present elsewhere in the file.
+        """
+        if not hasattr(self, 'audio') or self.audio is None:
+            messagebox.showwarning("No Audio", "Please load a WAV file first.")
+            return
+        n_accepted = self.replace_with_all_entropy_suggestions()
+        self.classify_unlabeled_segments(
+            extra_msg=f"Accepted {n_accepted} suggested segment(s) in view.")
 
     # ================================================================
     # Full annotation pipeline (segmentation + classification)
@@ -937,12 +969,17 @@ class IntegratedSpectrogramViewer:
     # ================================================================
 
     def replace_with_all_entropy_suggestions(self, event=None):
+        """Turn the entropy suggestions inside the current window into segments.
+
+        Returns the number of suggestions that were accepted, so callers that
+        chain further work onto this action can report it.
+        """
         window_start = self.current_window_start
         window_end   = window_start + self.window_duration
 
         suggestions = self.compute_suggestions()
         if not suggestions:
-            return
+            return 0
 
         def overlaps(a_start, a_end, b_start, b_end, eps=1e-9):
             return (a_start < b_end - eps) and (b_start < a_end - eps)
@@ -950,12 +987,12 @@ class IntegratedSpectrogramViewer:
         in_view = [(t0, t1) for (t0, t1) in suggestions
                    if (t0 >= window_start) and (t1 <= window_end)]
         if not in_view:
-            return
+            return 0
 
         in_view.sort(key=lambda x: (x[0], x[1]))
         candidates = in_view[:-1]
         if not candidates:
-            return
+            return 0
 
         new_segments = list(self.segments)
         existing_intervals = [(s[0], s[1]) for s in new_segments]
@@ -976,6 +1013,7 @@ class IntegratedSpectrogramViewer:
             self.update_plots()
             if self.annotation_callback:
                 self.annotation_callback(self.segments)
+        return len(accepted)
 
     def activate_entropy_replace_mode(self, event=None):
         self.deactivate_all_modes()
@@ -1863,11 +1901,12 @@ class IntegratedSpectrogramViewer:
     # ================================================================
 
     def activate_auto_suggest_mode(self):
-        if not self.syllable_templates:
+        if self.suggestion_engine is None:
             messagebox.showinfo(
                 "Auto Annotate",
-                "No syllable templates available yet.\n"
-                "Annotate some segments first, then press 'Recalc Templates'.")
+                f"No syllable templates yet.\n\nA label gets one once it has "
+                f"{template_store.MIN_SEGMENTS} annotated segments; press "
+                f"'Recalc Templates' to fit them now.")
             return
         self.deactivate_all_modes()
         self.auto_suggest_mode = True
@@ -1927,10 +1966,11 @@ class IntegratedSpectrogramViewer:
             t_seg_start, t_seg_end, annot = seg[0], seg[1], seg[2]
             mid = (t_seg_start + t_seg_end) / 2.0
             if region_start <= mid <= region_end:
-                suggestions = self.syllable_suggestions(t_seg_start, t_seg_end)
+                suggestions = self.syllable_suggestions(t_seg_start, t_seg_end,
+                                                        top_k=1)
                 if suggestions:
-                    best_id, best_dist = suggestions[0]
-                    new_segments.append((t_seg_start, t_seg_end, best_id))
+                    new_segments.append((t_seg_start, t_seg_end,
+                                         suggestions[0].label))
                     changed += 1
                 else:
                     new_segments.append(seg)
@@ -1981,6 +2021,7 @@ class IntegratedSpectrogramViewer:
             "o: Zoom Out\n"
             "i: Zoom In\n"
             "v: Toggle Human Verified\n"
+            "x: Accept Suggestions in View + Classify 999 Segments\n"
         )
         messagebox.showinfo("Directions", directions_text)
 
@@ -2103,9 +2144,9 @@ class IntegratedSpectrogramViewer:
                       "Annotate some segments, then press 'Recalc Templates'."))
             return
 
-        # ── Spectrogram of the medoid (most representative) instance ──
-        # Same logic as the DTW template: the displayed/played syllable is the
-        # real instance with the smallest total DTW distance to all others.
+        # ── The template itself ──
+        # What is displayed is exactly what is scored: the band-limited window
+        # the bank holds, cut from the most typical rendition of this label.
         spec = tmpl_data["spec"]
         try:
             color = self.palette[syllable_number - 1]
@@ -2120,7 +2161,7 @@ class IntegratedSpectrogramViewer:
         FigureCanvasTkAgg(fig, master=top).get_tk_widget().pack(padx=5, pady=5)
 
         # ── Audio playback of that same instance ──
-        seg = self._load_medoid_audio(tmpl_data)
+        seg = self._load_template_audio(tmpl_data)
         if seg is not None:
             data, fs = seg
             play_frame = tk.Frame(top)
@@ -2136,13 +2177,12 @@ class IntegratedSpectrogramViewer:
             tk.Label(top, text="(audio for this template is unavailable)",
                      fg="gray").pack(pady=5)
 
-    def _load_medoid_audio(self, tmpl_data, pad=0.05):
-        """Load the audio for a template's medoid instance.
+    def _load_template_audio(self, tmpl_data, pad=0.05):
+        """Load the audio the template was cut from.
 
-        Returns ``(data, fs)`` for the syllable segment (plus a little padding),
-        or ``None``.  Reads the source wav when its path is known; falls back to
-        the currently-loaded audio for templates whose medoid came from the
-        current file (``source_path`` is ``None``).
+        Returns ``(data, fs)`` for that window (plus a little padding), or
+        ``None`` when the bank has no provenance for it or the wav cannot be
+        resolved.
         """
         t0 = tmpl_data.get("source_start")
         t1 = tmpl_data.get("source_end")
@@ -2221,55 +2261,30 @@ class IntegratedSpectrogramViewer:
     # Data loading & results
     # ================================================================
 
-    def load_existing_data(self, y, fs, file, seg_vector, annot_vector,
-                           existing_segments=None, noise_audio=None):
+    def load_existing_data(self, y, fs, file, existing_segments=None,
+                           noise_audio=None):
         b, a = butter(N=4, Wn=1000 / (fs / 2), btype='highpass')
         y_hp = filtfilt(b, a, y)  # noqa: F841  # computed but original used
         self.audio = y
         self.fs = fs
         self.wav_filename = file
+        # Belongs to the song that just closed, not to this one.
+        self._scoring_spectrogram = None
         self.noise_audio = noise_audio
 
-        if seg_vector is None or (hasattr(seg_vector, "size")
-                                  and seg_vector.size == 0):
-            seg_vector = np.zeros(len(y), dtype=int)
-        if annot_vector is None or (hasattr(annot_vector, "size")
-                                    and annot_vector.size == 0):
-            annot_vector = np.zeros(len(y), dtype=int)
-
-        seg_changes = np.diff(np.concatenate(([0], seg_vector, [0])))
-        seg_starts = np.where(seg_changes == 1)[0]
-        seg_ends = np.where(seg_changes == -1)[0]
+        # The annotation list is taken verbatim. It must NOT be rebuilt from a
+        # sample-level binary vector: segments that touch (end of one == start
+        # of the next) paint one uninterrupted run of samples, so reading the
+        # runs back collapses them into a single segment carrying the first
+        # one's label. That silently merged 7 → 15 → 16 into one phrase 7.
         self.segments = []
-        for start, end in zip(seg_starts, seg_ends):
-            t_start = start / fs
-            t_end = end / fs
-            seg_ann = annot_vector[start:end]
-            nonzero = np.nonzero(seg_ann)[0]
-            if nonzero.size > 0:
-                annot = int(seg_ann[nonzero[0]])
+        for seg in existing_segments or []:
+            annot = seg[2] if seg[2] is None else int(seg[2])
+            if len(seg) > 3 and seg[3]:
+                self.segments.append((float(seg[0]), float(seg[1]), annot, True))
             else:
-                annot = 999
-            self.segments.append((t_start, t_end, annot))
-
-        # Re-attach AI flags: the binary round-trip loses the 4th element.
-        # Match by (onset, offset) with ±10 ms tolerance.
-        if existing_segments:
-            ai_pairs = [
-                (s[0], s[1])
-                for s in existing_segments
-                if len(s) > 3 and s[3]
-            ]
-            if ai_pairs:
-                tagged = []
-                for seg in self.segments:
-                    t_s, t_e, ann = seg
-                    is_ai = any(
-                        abs(t_s - p0) < 0.01 and abs(t_e - p1) < 0.01
-                        for p0, p1 in ai_pairs
-                    )
-                    tagged.append((t_s, t_e, ann, True) if is_ai else seg)
-                self.segments = tagged
+                self.segments.append((float(seg[0]), float(seg[1]), annot))
+        self.segments.sort(key=lambda s: s[0])
 
         noverlap = self.nfft - int(0.001 * fs)
         NW = 4
@@ -2342,66 +2357,76 @@ class IntegratedSpectrogramViewer:
         return self.wav_filename, self.audio, self.fs, seg_vector, annot_vector
 
     # ================================================================
-    # DTW / syllable suggestions  (delegates to dtw_suggestions module)
+    # Syllable suggestions  (cross-correlation against the template bank)
     # ================================================================
 
     def _extract_syllable_spectrogram(self, t_start, t_end):
-        return dtw.extract_syllable_spectrogram(
+        return spectrograms.extract_syllable_spectrogram(
             self.S_norm, self.T, t_start, t_end)
 
     @staticmethod
-    def _resample_spectrogram_time(spec, target_cols=TEMPLATE_COLS):
-        return dtw.resample_spectrogram_time(spec, target_cols)
-
-    @staticmethod
-    def _dtw_distance(seq_a, seq_b):
-        return dtw.dtw_distance(seq_a, seq_b)
-
-    @staticmethod
     def _compute_spectrogram_for_audio(y, fs, nfft=512):
-        return dtw.compute_spectrogram_for_audio(y, fs, nfft)
+        return spectrograms.compute_spectrogram_for_audio(y, fs, nfft)
 
-    @staticmethod
-    def build_global_syllable_templates(db_data, date_to_wavs, nfft=512,
-                                        template_cols=TEMPLATE_COLS,
-                                        max_instances_per_label=MAX_INSTANCES_PER_LABEL,
-                                        verbose=False):
-        return dtw.build_global_syllable_templates(
-            db_data, date_to_wavs, nfft=nfft, template_cols=template_cols,
-            max_instances_per_label=max_instances_per_label, verbose=verbose)
+    def set_template_bank(self, bank):
+        """Adopt a freshly fitted bank (or ``None``) and drop stale state.
 
-    @staticmethod
-    def build_global_syllable_templates_cached(db_data, date_to_wavs, cache_path,
-                                               nfft=512, template_cols=TEMPLATE_COLS,
-                                               max_instances_per_label=MAX_INSTANCES_PER_LABEL,
-                                               verbose=True):
-        return dtw.build_global_syllable_templates_cached(
-            db_data, date_to_wavs, cache_path,
-            nfft=nfft, template_cols=template_cols,
-            max_instances_per_label=max_instances_per_label, verbose=verbose)
+        Called both at construction and when a background fit finishes, so a
+        viewer opened while templates were still building starts suggesting as
+        soon as they land.
+        """
+        self.template_bank = bank
+        self.suggestion_engine = SuggestionEngine(bank) if bank else None
+        self.syllable_templates = template_store.as_display_templates(
+            bank, self.date_to_wavs)
+        self._scoring_spectrogram = None      # recomputed for the open song
 
-    def _build_syllable_templates(self):
-        self.syllable_templates = dtw.build_syllable_templates(
-            self.S_norm, self.T, self.segments,
-            self.db_data, self.date_to_wavs,
-            nfft=self.nfft,
-            wav_filename=getattr(self, 'wav_filename', None),
-            template_cols=self.TEMPLATE_COLS,
-            max_instances_per_label=self.MAX_INSTANCES_PER_LABEL)
-        return self.syllable_templates
+    def _scoring_view(self):
+        """``(S, T)`` of the open song at the *bank's* spectrogram parameters.
+
+        The viewer's own ``S_norm`` cannot be scored against a bank: it is
+        percentile-clipped to [0, 1] at a finer hop over the full band.  This
+        second spectrogram costs about 150 ms and is computed once per song
+        rather than once per suggestion.
+        """
+        if self.suggestion_engine is None:
+            return None, None
+        if self._scoring_spectrogram is None:
+            audio, fs = getattr(self, "audio", None), getattr(self, "fs", None)
+            if audio is None or fs is None:
+                return None, None
+            self._scoring_spectrogram = self.suggestion_engine.song_spectrogram(
+                audio, fs)
+        return self._scoring_spectrogram
+
+    def syllable_suggestions(self, t_start, t_end, top_k=TOP_K):
+        """The best labels for ``[t_start, t_end]``, best first."""
+        if self.suggestion_engine is None:
+            return []
+        S, T = self._scoring_view()
+        if S is None:
+            return []
+        return self.suggestion_engine.suggest(S, T, t_start, t_end,
+                                              top_k=top_k)
 
     def recalculate_syllable_templates(self):
-        self._build_syllable_templates()
-        n = len(self.syllable_templates)
-        ids = sorted(self.syllable_templates.keys())
-        messagebox.showinfo(
-            "Recalculate Templates",
-            f"Rebuilt {n} syllable template(s).\nIDs: {ids}")
+        """Refit every eligible label and prune the ones that have vanished.
 
-    def syllable_suggestions(self, t_start, t_end):
-        return dtw.syllable_suggestions(
-            self.S_norm, self.T, self.syllable_templates,
-            t_start, t_end, template_cols=self.TEMPLATE_COLS)
+        The only path that ever discards a template: startup adds, this
+        replaces.  It reads audio, so it runs on a worker thread behind a
+        progress window like the startup fit does.
+        """
+        if not self.bird_folder:
+            messagebox.showinfo("Recalculate Templates",
+                                "No bird folder — nothing to fit templates from.")
+            return
+        if self.template_refresh_callback is not None:
+            self.template_refresh_callback()
+            return
+        result = template_store.ensure(self.bird_folder, self.db_data,
+                                       self.date_to_wavs, force=True)
+        self.set_template_bank(result.bank)
+        messagebox.showinfo("Recalculate Templates", result.summary())
 
     # ================================================================
     # Prune mismatched-duration labels
@@ -2551,8 +2576,9 @@ class IntegratedSpectrogramViewer:
         if not suggestions:
             messagebox.showinfo(
                 "Syllable Suggest",
-                "No annotated syllable templates found yet.\n"
-                "Annotate some segments first (key 'a').")
+                f"Nothing to suggest.\n\nEither no label has reached "
+                f"{template_store.MIN_SEGMENTS} annotated segments yet, or "
+                f"the selection is too short to score.")
             return
         self._show_suggestions_popup(t_start, t_end, suggestions)
 
@@ -2577,16 +2603,21 @@ class IntegratedSpectrogramViewer:
                  text="Double-click a row to assign that label (or press Assign).",
                  font=("Arial", 9)).pack(anchor='w', padx=8)
 
-        cols = ("Rank", "Syllable ID", "DTW Distance")
+        cols = ("Rank", "Syllable ID", "Match", "Covered")
         tree = ttk.Treeview(top, columns=cols, show='headings', height=8)
         for c in cols:
             tree.heading(c, text=c)
             tree.column(c, width=100, anchor='center')
         tree.pack(fill='both', expand=True, padx=5, pady=5)
 
-        for rank, (annot_id, dist) in enumerate(suggestions, start=1):
+        # "Covered" is the fraction of the template the selection was long
+        # enough to score against.  Anything below 100% means the selection
+        # was matched against part of the template only, which a long generic
+        # template makes easy — so the number is shown rather than hidden.
+        for rank, s in enumerate(suggestions, start=1):
             tree.insert('', 'end',
-                        values=(rank, annot_id, f"{dist:.4f}"))
+                        values=(rank, s.label, f"{s.score:.3f}",
+                                f"{s.coverage * 100:.0f}%"))
 
         fig_t = plt.Figure(figsize=(6, 1.5), dpi=100)
         ax_t = fig_t.add_subplot(111)

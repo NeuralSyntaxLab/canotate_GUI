@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from bird_song_detector.nn_segmentation import InferenceToAnnotationData
+from bird_song_detector.nn_segmentation.segmentation_utils import _merge_close_segments
 from classification_model.segment_classifier import (
     SegmentClassifier,
     UNLABELED,
@@ -35,6 +36,8 @@ from classification_model.segment_classifier import (
 # Single source of truth for where weights live — see cannotate_utils, which
 # honours the CANNOTATE_MODELS_DIR override.
 from cannotate.cannotate_utils import ONNX_DEFAULT_WEIGHTS  # noqa: E402,F401
+from cannotate.onnx_segmentation import OnnxSegmentationModel  # noqa: E402,F401
+from utils import song_wavs_under
 
 
 def _best_device():
@@ -43,49 +46,6 @@ def _best_device():
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-class OnnxSegmentationModel:
-    """Wraps an ONNX InferenceSession to look like a PyTorch model.
-
-    Accepted by ``InferenceToAnnotationData`` — the architecture (ConvMLP) is
-    baked into the ONNX graph exported from bird_song_detector.
-    Input: ``[batch, 256]`` float32.  Output: ``[batch, 1]`` raw logits.
-    """
-
-    def __init__(self, onnx_path: Union[str, Path]):
-        import onnxruntime as ort
-        providers = ["CPUExecutionProvider"]
-        try:
-            available = ort.get_available_providers()
-            for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider"):
-                if p in available:
-                    providers.insert(0, p)
-                    break
-        except Exception:
-            pass
-        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
-        self._input_name = self._session.get_inputs()[0].name
-
-    def eval(self):
-        return self
-
-    def preprocess_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert torch.Tensor to float32 numpy array for ONNX runtime."""
-        x = x.cpu().numpy().astype("float32")
-        x= x**2
-        mean_x = x.mean(axis=1, keepdims=True)
-        std_x = x.std(axis=1, keepdims=True)
-        x = (x - mean_x) / (std_x + 1e-6)
-        return x
-
-    def to(self, device):
-        return self  # onnxruntime selects its own execution provider
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        x_np = self.preprocess_input(x)
-        outputs = self._session.run(None, {self._input_name: x_np})
-        return torch.from_numpy(outputs[0])
 
 
 def is_ai_segment(seg) -> bool:
@@ -112,6 +72,7 @@ class FullAnnotationPipeline:
         clf_windows_per_segment: int = 3,
         dense: bool = True,
         fill_gaps: bool = True,
+        merge_gap_threshold: float = 2 / 100,
     ):
         self._segmenter = segmenter
         self._classifier = classifier
@@ -120,6 +81,7 @@ class FullAnnotationPipeline:
         self._clf_windows = int(clf_windows_per_segment)
         self._dense = bool(dense)
         self._fill_gaps = bool(fill_gaps)
+        self._merge_gap = float(merge_gap_threshold)
 
     # ---------------------------------------------------------------- loading
     @classmethod
@@ -257,11 +219,20 @@ class FullAnnotationPipeline:
             fill_gaps=self._fill_gaps,
         )
 
-        # Step 3 — tag every output as AI-generated
-        return [
-            (float(p.onset_s), float(p.offset_s), p.label, True)
-            for p in predictions
-        ]
+        # Step 3 — merge segments that are now known to share a real label and
+        # sit close together (e.g. a one-frame detector dropout inside a
+        # single syllable). Done here, after classification, because only now
+        # do segments carry their real label — merging on time alone at the
+        # segmentation stage can't tell that dropout apart from a short but
+        # genuine pause between two different syllables.
+        merged = _merge_close_segments(
+            [[p.onset_s, p.offset_s, p.label] for p in predictions],
+            gap_threshold=self._merge_gap,
+        )
+
+        # Step 4 — tag every output as AI-generated
+        return [(float(onset), float(offset), label, True)
+                for onset, offset, label in merged]
 
     # ---------------------------------------------------------------- batch
     def annotate_directory(
@@ -279,7 +250,9 @@ class FullAnnotationPipeline:
 
         Parameters
         ----------
-        wav_dir             : directory to search recursively for *.wav files
+        wav_dir             : directory searched recursively for song wavs --
+                              only files inside a folder named ``wav`` count,
+                              so syllable clips and exports are left alone
         annotation_json     : path to the project annotation JSON (created if absent)
         skip_fully_annotated: when True, skip files that already have at least one
                               manually labeled (non-999, non-AI) segment
@@ -294,7 +267,7 @@ class FullAnnotationPipeline:
             else {}
         )
 
-        wav_files = sorted(wav_dir.rglob("*.wav"))
+        wav_files = [Path(p) for p in song_wavs_under(str(wav_dir))]
         total = len(wav_files)
         if total == 0:
             print(f"[pipeline] no WAV files found under {wav_dir}")
@@ -335,14 +308,17 @@ class FullAnnotationPipeline:
             if existing is not None:
                 # keep manual segments, replace AI segments
                 manual = [s for s in existing.get("segments", []) if not is_ai_segment(s)]
-                existing["segments"] = manual + [list(s) for s in new_segs]
+                merged_segs = manual + [list(s) for s in new_segs]
+                merged_segs.sort(key=lambda s: s[0])
+                existing["segments"] = merged_segs
             else:
                 day_entries.append(
                     {
                         "file_name": file_name,
                         # Machine-generated: only a human can flip this.
                         "human_verified": False,
-                        "segments": [list(s) for s in new_segs],
+                        "segments": sorted(
+                            (list(s) for s in new_segs), key=lambda s: s[0]),
                     }
                 )
 
