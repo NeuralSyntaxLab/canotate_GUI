@@ -5,9 +5,19 @@ Disposable experiment behind
 **can spectrogram cross-correlation against per-label templates identify
 mislabeled phrases?**
 
-Nothing in the repo imports from here.  If the answer holds up, `scoring.py`
-is the piece that graduates into `cannotate/` and fills in
-`CrossCorrelationOutlierDetector`.
+Nothing in the repo imports from here, and nothing should: this is the
+experiment record, kept for the measurements below and the controls behind
+them.
+
+**The answer held up, and the code has graduated.**  `scoring.py`, `spectro.py`
+and the production path of `detect.py` now live in `cannotate/xcorr/`, where
+they fill in `CrossCorrelationOutlierDetector` — see section 9.1 of
+`ANNOTATION_TOOL_GUIDE.md` for the tool users see.  The graduated copy drops
+the patch cache (a scan touches each phrase once) and takes its audio through
+an injected loader rather than `config.py`'s hard-coded paths.  Re-measured
+through the package on 150 verified files with a 22-label bank: **95.0%
+agreement, 14.6 files/s on four workers**, with 3->26 and 18->1 still the two
+dominant confusions.
 
 ## Running it
 

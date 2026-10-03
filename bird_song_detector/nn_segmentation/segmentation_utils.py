@@ -5,17 +5,19 @@ import json
 
 def _merge_close_segments(annotation_data, gap_threshold=2/100):
     """
-    Merges consecutive segments whose gap is smaller than gap_threshold (seconds).
-    Keeps the minimum label of the merged group.
+    Merges consecutive segments whose gap is smaller than gap_threshold (seconds)
+    AND that already share the same label. Segments with different labels are
+    never merged, no matter how small the gap between them — two touching or
+    near-touching segments with different labels are distinct syllables, not
+    a dropout inside one call.
     """
     if not annotation_data:
         return annotation_data
     merged = [list(annotation_data[0])]
     for seg in annotation_data[1:]:
         gap = seg[0] - merged[-1][1]
-        if gap < gap_threshold:
+        if gap < gap_threshold and seg[2] == merged[-1][2]:
             merged[-1][1] = seg[1]                        # extend end time
-            merged[-1][2] = min(merged[-1][2], seg[2])   # keep min label
         else:
             merged.append(list(seg))
     return merged

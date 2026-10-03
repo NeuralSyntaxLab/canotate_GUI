@@ -4,7 +4,8 @@ The external drive is the slow part of this sandbox, so it is read exactly
 once.  Which instances are wanted is decided from the annotation metadata
 *before* any audio is touched, so only files holding a wanted instance are
 ever opened — the same discipline as
-``dtw_suggestions.plan_instance_selection``, for the same reason.
+the annotation metadata first, for the same reason (the GUI-side version of
+that walk has since been removed with the DTW templates).
 
 Run:  python cache.py [--max-per-label N]
 """

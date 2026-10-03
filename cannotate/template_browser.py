@@ -368,32 +368,148 @@ def open_template_browser(root, db_data, date_to_wavs, global_songs,
             sel_status.config(text="")
         elif n_sel == 0:
             sel_status.config(
-                text=f"{n_tot} segments shown — click a segment to select it")
+                text=f"{n_tot} segments shown — click to select, "
+                     "drag a border to resize")
         else:
             sel_status.config(
                 text=f"{n_sel}/{n_tot} segments selected for relabeling")
 
-    def _render_display(full, fs0, seg_infos, title):
-        """Draw spectrogram of *full* with one toggleable span per pick.
+    # ── Annotation lookup / persistence helpers ───────────
+
+    def _locate_seg(pick):
+        """Return (entry, index) of the db_data segment backing *pick*."""
+        d = pick.get("date")
+        fn = pick.get("file_name")
+        try:
+            t0 = float(pick.get("t0"))
+            t1 = float(pick.get("t1"))
+        except Exception:
+            return None, -1
+        best = (None, -1, 1e-3)
+        for entry in db_data.get(d, []):
+            if entry.get("file_name") != fn:
+                continue
+            for i, seg in enumerate(entry.get("segments", [])):
+                try:
+                    ss, se = float(seg[0]), float(seg[1])
+                except Exception:
+                    continue
+                dist = abs(ss - t0) + abs(se - t1)
+                if dist < best[2]:
+                    best = (entry, i, dist)
+        return best[0], best[1]
+
+    def _save_annotations():
+        try:
+            with open(annotation_file, "w") as f:
+                json.dump(db_data, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save annotations: {e}")
+            return False
+        try:
+            refresh_counts()
+        except Exception:
+            pass
+        try:
+            refresh_types_list()
+        except Exception:
+            pass
+        return True
+
+    def _refresh_song_list_keep_display():
+        """Re-gather instances for the current type without clearing the view."""
+        nonlocal instances, songs_map, song_indices, filtered_song_indices
+        instances = gather_instances(syll_num)
+        songs_map = {}
+        for inst in instances:
+            songs_map.setdefault(inst["song_index"], []).append(inst)
+        song_indices = sorted(songs_map.keys())
+        filtered_song_indices = song_indices.copy()
+        try:
+            update_song_list()
+        except Exception:
+            pass
+
+    # ── Display rendering ─────────────────────────────────
+
+    MIN_SEG_DUR = 0.002   # shortest segment a drag / split may produce (s)
+
+    def _seg_index(d):
+        """Identity-based position of *d* inside displayed_segments."""
+        for i, o in enumerate(displayed_segments):
+            if o is d:
+                return i
+        return -1
+
+    def _seg_label(d):
+        entry, i = _locate_seg(d["pick"])
+        if entry is None:
+            return d.get("label")
+        try:
+            return _parse_label(entry["segments"][i][2])
+        except Exception:
+            return d.get("label")
+
+    def _label_color(lab):
+        try:
+            return (local_palette[int(lab) - 1]
+                    if local_palette is not None else 'yellow')
+        except Exception:
+            return 'yellow'
+
+    def _draw_segment_artists(d):
+        """(Re)create the span + label text for one displayed segment."""
+        for key in ("patch", "text"):
+            art = d.get(key)
+            if art is not None:
+                try:
+                    art.remove()
+                except Exception:
+                    pass
+                d[key] = None
+        color = _label_color(d.get("label"))
+        d["patch"] = ax.axvspan(d["b0"], d["b1"], color=color, alpha=0.25)
+        d["text"] = ax.text(
+            0.5 * (d["b0"] + d["b1"]), 0.97, str(d.get("label")),
+            transform=ax.get_xaxis_transform(), ha='center', va='top',
+            fontsize=8, color='black',
+            bbox=dict(facecolor='white', alpha=0.6, pad=1, edgecolor='none'))
+        _set_segment_selected(d, d.get("selected", False))
+
+    def _render_display(full, fs0, seg_infos, title, mode='concat',
+                        window_start=0.0):
+        """Draw spectrogram of *full* with one editable span per pick.
 
         seg_infos : list of (pick, t_start, t_end) in display coordinates.
+        mode      : 'natural' when *full* is a contiguous slice of one file
+                    (borders may move anywhere inside the loaded window),
+                    'concat' when segments were spliced together (borders
+                    may only move inside each segment's own audio).
+        window_start : file time of display time 0 (natural mode only).
         """
         nonlocal last_displayed_picks
         displayed_segments.clear()
         last_displayed_picks = [p for p, _, _ in seg_infos]
         try:
+            total = len(full) / fs0
             S_norm, F, T = _compute_spectrogram_norm(full, fs0)
             ax.clear()
             ax.imshow(S_norm, aspect='auto', origin='lower',
-                      extent=[0, len(full) / fs0, F[0], F[-1]],
+                      extent=[0, total, F[0], F[-1]],
                       cmap='gray_r', vmin=0, vmax=1)
-            color = _syll_color()
             for p, b0, b1 in seg_infos:
-                patch = ax.axvspan(b0, b1, color=color, alpha=0.25)
-                displayed_segments.append({
-                    "pick": p, "b0": b0, "b1": b1,
-                    "patch": patch, "selected": False,
-                })
+                if mode == 'natural':
+                    off, lo, hi = window_start, 0.0, total
+                else:
+                    off, lo, hi = float(p["t0"]) - b0, b0, b1
+                d = {
+                    "pick": p, "b0": b0, "b1": b1, "off": off,
+                    "lo": lo, "hi": hi, "selected": False,
+                    "patch": None, "text": None,
+                }
+                d["label"] = _seg_label(d)
+                displayed_segments.append(d)
+                _draw_segment_artists(d)
             ax.set_title(title)
             ax.set_xlabel("Time (s)")
             canvas.draw()
@@ -405,27 +521,163 @@ def open_template_browser(root, db_data, date_to_wavs, global_songs,
 
     def _set_segment_selected(d, selected):
         d["selected"] = selected
+        patch = d.get("patch")
+        if patch is None:
+            return
         if selected:
-            d["patch"].set_alpha(0.45)
-            d["patch"].set_edgecolor('red')
-            d["patch"].set_linewidth(2)
+            patch.set_alpha(0.45)
+            patch.set_edgecolor('red')
+            patch.set_linewidth(2)
         else:
-            d["patch"].set_alpha(0.25)
-            d["patch"].set_edgecolor('none')
-            d["patch"].set_linewidth(0)
+            patch.set_alpha(0.25)
+            patch.set_edgecolor('none')
+            patch.set_linewidth(0)
 
-    def _on_canvas_click(event):
+    # ── Border dragging & splitting ───────────────────────
+
+    split_mode = tk.BooleanVar(value=False)
+    drag_state = {"d": None, "edge": None, "moved": False}
+
+    def _edge_tol():
+        """~6 pixels expressed in data (seconds) units."""
+        try:
+            x0, x1 = ax.get_xlim()
+            w = ax.get_window_extent().width
+            return 6.0 * (x1 - x0) / max(w, 1.0)
+        except Exception:
+            return 0.005
+
+    def _neighbour_limits(d):
+        """Clamp range for *d* so it never overlaps a neighbour of same file."""
+        lo, hi = d["lo"], d["hi"]
+        for o in displayed_segments:
+            if o is d:
+                continue
+            if (o["pick"].get("file_name") != d["pick"].get("file_name")
+                    or o["pick"].get("date") != d["pick"].get("date")):
+                continue
+            if o["b1"] <= d["b0"] + 1e-9:
+                lo = max(lo, o["b1"])
+            elif o["b0"] >= d["b1"] - 1e-9:
+                hi = min(hi, o["b0"])
+        return lo, hi
+
+    def _commit_borders(d):
+        """Write the (possibly dragged) borders of *d* back to db_data."""
+        entry, i = _locate_seg(d["pick"])
+        if entry is None:
+            messagebox.showerror(
+                "Error", "Could not find the segment in the annotation file.")
+            return False
+        new_t0 = d["b0"] + d["off"]
+        new_t1 = d["b1"] + d["off"]
+        seg = entry["segments"][i]
+        lab = seg[2] if len(seg) >= 3 else d.get("label")
+        entry["segments"][i] = [new_t0, new_t1, lab]
+        d["pick"]["t0"] = new_t0
+        d["pick"]["t1"] = new_t1
+        return _save_annotations()
+
+    def _split_segment(d, x):
+        """Split displayed segment *d* at display time *x* into two."""
+        if not (d["b0"] + MIN_SEG_DUR <= x <= d["b1"] - MIN_SEG_DUR):
+            messagebox.showinfo(
+                "Split", "Click further from the segment's edges to split it.")
+            return
+        entry, i = _locate_seg(d["pick"])
+        if entry is None:
+            messagebox.showerror(
+                "Error", "Could not find the segment in the annotation file.")
+            return
+        seg = entry["segments"][i]
+        lab = seg[2] if len(seg) >= 3 else d.get("label")
+        t_mid = x + d["off"]
+        t0 = d["b0"] + d["off"]
+        t1 = d["b1"] + d["off"]
+        entry["segments"][i] = [t0, t_mid, lab]
+        entry["segments"].insert(i + 1, [t_mid, t1, lab])
+
+        right_pick = dict(d["pick"])
+        right_pick["t0"] = t_mid
+        right_pick["t1"] = t1
+        d["pick"]["t0"] = t0
+        d["pick"]["t1"] = t_mid
+
+        right = {
+            "pick": right_pick, "b0": x, "b1": d["b1"], "off": d["off"],
+            "lo": d["lo"], "hi": d["hi"], "selected": False,
+            "patch": None, "text": None, "label": _parse_label(lab),
+        }
+        d["b1"] = x
+        _draw_segment_artists(d)
+        displayed_segments.insert(_seg_index(d) + 1, right)
+        _draw_segment_artists(right)
+        last_displayed_picks.append(right_pick)
+
+        if _save_annotations():
+            _refresh_song_list_keep_display()
+        canvas.draw_idle()
+        _update_sel_status()
+
+    def _on_canvas_press(event):
         if event.inaxes is not ax or event.xdata is None:
             return
         x = event.xdata
+        tol = _edge_tol()
+
+        # 1) grabbing a border wins over selecting / splitting
+        best = None
+        for d in displayed_segments:
+            for edge, pos in (("b0", d["b0"]), ("b1", d["b1"])):
+                dist = abs(x - pos)
+                if dist <= tol and (best is None or dist < best[2]):
+                    best = (d, edge, dist)
+        if best is not None:
+            drag_state["d"], drag_state["edge"] = best[0], best[1]
+            drag_state["moved"] = False
+            return
+
+        # 2) inside a segment: split or toggle selection
         for d in displayed_segments:
             if d["b0"] <= x <= d["b1"]:
-                _set_segment_selected(d, not d["selected"])
-                canvas.draw_idle()
-                _update_sel_status()
+                if split_mode.get():
+                    _split_segment(d, x)
+                else:
+                    _set_segment_selected(d, not d["selected"])
+                    canvas.draw_idle()
+                    _update_sel_status()
                 return
 
-    canvas.mpl_connect('button_press_event', _on_canvas_click)
+    def _on_canvas_motion(event):
+        d = drag_state["d"]
+        if d is None or event.inaxes is not ax or event.xdata is None:
+            return
+        lo, hi = _neighbour_limits(d)
+        x = float(event.xdata)
+        if drag_state["edge"] == "b0":
+            x = min(max(x, lo), d["b1"] - MIN_SEG_DUR)
+            d["b0"] = x
+        else:
+            x = max(min(x, hi), d["b0"] + MIN_SEG_DUR)
+            d["b1"] = x
+        drag_state["moved"] = True
+        _draw_segment_artists(d)
+        canvas.draw_idle()
+
+    def _on_canvas_release(event):
+        d = drag_state["d"]
+        drag_state["d"] = None
+        drag_state["edge"] = None
+        if d is None or not drag_state["moved"]:
+            return
+        drag_state["moved"] = False
+        if _commit_borders(d):
+            _refresh_song_list_keep_display()
+        canvas.draw_idle()
+
+    canvas.mpl_connect('button_press_event', _on_canvas_press)
+    canvas.mpl_connect('motion_notify_event', _on_canvas_motion)
+    canvas.mpl_connect('button_release_event', _on_canvas_release)
 
     # ── Build & show ───────────────────────────────────────
 
@@ -570,11 +822,46 @@ def open_template_browser(root, db_data, date_to_wavs, global_songs,
             refresh_types_list()
         except Exception:
             pass
+        # Keep the current view (and any sub-segments just created) intact —
+        # only the colours / label texts and the song list need refreshing.
+        for d in displayed_segments:
+            if d["pick"] in targets:
+                d["label"] = _parse_label(new_label)
+                _draw_segment_artists(d)
+        canvas.draw_idle()
         try:
-            change_syllable(syll_num)
+            _refresh_song_list_keep_display()
         except Exception:
             pass
         messagebox.showinfo("Labels updated", f"Updated {changed} segments to label {new_label}.")
+
+    def split_selected_into_n():
+        """Cut each selected segment into N equal-duration sub-segments."""
+        targets = [d for d in displayed_segments if d["selected"]]
+        if len(targets) != 1:
+            messagebox.showinfo(
+                "Split", "Select exactly one segment to split.")
+            return
+        n = simpledialog.askinteger(
+            "Split segment", "Split into how many equal parts?",
+            parent=top, minvalue=2, maxvalue=50)
+        if not n:
+            return
+        d = targets[0]
+        if (d["b1"] - d["b0"]) / n < MIN_SEG_DUR:
+            messagebox.showinfo(
+                "Split", "Segment is too short to split that many times.")
+            return
+        # Split repeatedly at the left-most cut so each new right half stays
+        # available for the next cut.
+        width = (d["b1"] - d["b0"]) / n
+        for _ in range(n - 1):
+            cur = d
+            _split_segment(cur, cur["b0"] + width)
+            nxt = _seg_index(cur) + 1
+            if nxt <= 0 or nxt >= len(displayed_segments):
+                break
+            d = displayed_segments[nxt]
 
     def clear_segment_selection():
         for d in displayed_segments:
@@ -589,6 +876,10 @@ def open_template_browser(root, db_data, date_to_wavs, global_songs,
         btn_clear_sel = tk.Button(btn_frame, text="Clear Selection",
                                   command=clear_segment_selection)
         btn_clear_sel.pack(side=tk.LEFT, padx=6)
+        tk.Checkbutton(btn_frame, text="Split mode (click inside a segment)",
+                       variable=split_mode).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Split Selected into N…",
+                  command=split_selected_into_n).pack(side=tk.LEFT, padx=6)
     except Exception:
         pass
 
@@ -643,7 +934,8 @@ def open_template_browser(root, db_data, date_to_wavs, global_songs,
             uniq = sorted({p['song_index'] for p in picks})
             _render_display(full, fs0, seg_infos,
                             f"Syllable {syll_num} — natural concatenation — songs: "
-                            + ", ".join(str(u+1) for u in uniq))
+                            + ", ".join(str(u+1) for u in uniq),
+                            mode='natural', window_start=window_start)
             return
 
         # Fallback: concatenate individual segments with small gaps
@@ -874,3 +1166,16 @@ def open_template_browser(root, db_data, date_to_wavs, global_songs,
         update_song_list()
     except Exception:
         pass
+
+    # Handle so callers (and tests) can drive the window programmatically.
+    return {
+        "top": top, "fig": fig, "ax": ax, "canvas": canvas,
+        "displayed_segments": displayed_segments,
+        "build_from_picks": _build_from_picks,
+        "split_segment": _split_segment,
+        "split_mode": split_mode,
+        "commit_borders": _commit_borders,
+        "on_press": _on_canvas_press,
+        "on_motion": _on_canvas_motion,
+        "on_release": _on_canvas_release,
+    }

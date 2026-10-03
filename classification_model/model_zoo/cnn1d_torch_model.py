@@ -244,9 +244,36 @@ class NumpyLabelEncoder:
 
     @classmethod
     def load(cls, path: Path) -> "NumpyLabelEncoder":
+        """Restore the saved class order *verbatim*.
+
+        The saved order **is** the model's mapping from output index to label:
+        index i of the final Linear layer means ``classes[i]``. So it must be
+        adopted as-is, never re-derived. ``fit`` cannot be reused here because
+        it sorts (and de-duplicates) - for a model whose classes were not saved
+        in lexicographic order that silently shifts every prediction onto the
+        wrong label, with no error anywhere to show it.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"label_encoder.json not found next to the model: {path}. "
+                "It holds the output-index -> label mapping and is written "
+                "beside the weights by Conv1DClassifier.save; a model folder "
+                "cannot be used without the one that was saved with it."
+            )
         payload = json.loads(path.read_text(encoding="utf-8"))
+        labels = [str(c) for c in payload["classes"]]
+        if not labels:
+            raise ValueError(f"{path} lists no classes")
+        if len(set(labels)) != len(labels):
+            dupes = sorted({l for l in labels if labels.count(l) > 1})
+            raise ValueError(
+                f"{path} maps several output indices to the same label(s) "
+                f"{dupes}; the mapping is ambiguous."
+            )
         enc = cls()
-        enc.fit(np.asarray(payload["classes"], dtype=str))
+        enc.classes_ = np.asarray(labels, dtype=str)
+        enc.class_to_idx = {label: idx for idx, label in enumerate(labels)}
         return enc
 
 

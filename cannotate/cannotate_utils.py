@@ -194,6 +194,11 @@ def clean_segments(segments):
     Accepts 3-tuples (t_start, t_end, label) or 4-tuples where the 4th
     element is the AI-generated flag (True).  The flag is preserved so that
     the GUI can distinguish AI annotations from manual ones.
+
+    Segments come back sorted by start time — edits (splits, new draws) can
+    append pieces out of chronological order, and downstream code that walks
+    the list assuming ascending time (e.g. gap-based merging) would silently
+    misbehave on an unsorted list.
     """
     result = []
     for seg in segments:
@@ -204,10 +209,18 @@ def clean_segments(segments):
             result.append([t_start, t_end, label, True])
         else:
             result.append([t_start, t_end, label])
+    result.sort(key=lambda s: s[0])
     return result
 
 
 def binary_to_segments(seg_vector, annot_vector, fs):
+    """Recover segments from the sample-level binary vector format.
+
+    Lossy, and never to be used to read an annotation list that already
+    exists: segments that touch (end of one == start of the next) share one
+    uninterrupted run of samples, so they come back as a single segment
+    carrying the first one's label.
+    """
     seg_vector = np.array(seg_vector)
     annot_vector = np.array(annot_vector)
     if seg_vector.ndim != annot_vector.ndim:

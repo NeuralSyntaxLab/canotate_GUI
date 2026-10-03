@@ -1,0 +1,43 @@
+{
+  "dataset_pickle": "C:\\Projects\\tweetynet_flow\\LY10RB\\output\\conv1d_phrase_dataset.pkl",
+  "random_seed": 13,
+  "explicit_test_sources": null,
+  "train_wavs": [
+    "BigRecRoom_channel13_2026-08-26-07-00-47_02_chunk_11_onset_2026_08_26_07_06_19.wav",
+    "BigRecRoom_channel13_2026-08-26-07-00-47_02_chunk_12_onset_2026_08_26_07_06_46.wav",
+    "BigRecRoom_channel13_2026-08-26-07-00-47_02_chunk_13_onset_2026_08_26_07_09_09.wav",
+    "BigRecRoom_channel13_2026-08-26-07-00-47_02_chunk_14_onset_2026_08_26_07_09_44.wav",
+    "BigRecRoom_channel13_2026-08-26-07-00-47_02_chunk_15_onset_2026_08_26_07_10_14.wav",
+    "BigRecRoom_channel13_2026-08-26-07-11-16_02_chunk_3_onset_2026_08_26_07_14_38.wav",
+    "BigRecRoom_channel13_2026-08-26-07-11-16_02_chunk_4_onset_2026_08_26_07_14_56.wav",
+    "BigRecRoom_channel13_2026-08-26-07-11-16_02_chunk_5_onset_2026_08_26_07_15_07.wav",
+    "BigRecRoom_channel13_2026-08-26-07-11-16_02_chunk_6_onset_2026_08_26_07_15_38.wav",
+    "BigRecRoom_channel13_2026-08-26-07-11-16_02_chunk_7_onset_2026_08_26_07_16_07.wav",
+    "BigRecRoom_channel13_2026-08-26-07-11-16_02_chunk_8_onset_2026_08_26_07_16_37.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_10_onset_2026_08_26_07_27_22.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_11_onset_2026_08_26_07_27_52.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_13_onset_2026_08_26_07_28_15.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_2_onset_2026_08_26_07_22_55.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_4_onset_2026_08_26_07_23_50.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_5_onset_2026_08_26_07_24_24.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_6_onset_2026_08_26_07_25_07.wav",
+    "BigRecRoom_channel13_2026-08-26-07-32-16_02_chunk_2_onset_2026_08_26_07_34_08.wav",
+    "BigRecRoom_channel13_2026-08-26-07-32-16_02_chunk_3_onset_2026_08_26_07_34_36.wav",
+    "BigRecRoom_channel13_2026-08-26-07-32-16_02_chunk_9_onset_2026_08_26_07_42_26.wav",
+    "BigRecRoom_channel13_2026-08-26-07-42-46_02_chunk_3_onset_2026_08_26_07_43_06.wav",
+    "BigRecRoom_channel13_2026-08-26-08-24-44_02_chunk_4_onset_2026_08_26_08_29_44.wav"
+  ],
+  "val_wavs": [
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_7_onset_2026_08_26_07_25_45.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_8_onset_2026_08_26_07_26_44.wav",
+    "BigRecRoom_channel13_2026-08-26-07-32-16_02_chunk_4_onset_2026_08_26_07_34_53.wav"
+  ],
+  "test_wavs": [
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_3_onset_2026_08_26_07_23_28.wav",
+    "BigRecRoom_channel13_2026-08-26-07-21-46_02_chunk_9_onset_2026_08_26_07_26_56.wav",
+    "BigRecRoom_channel13_2026-08-26-07-32-16_02_chunk_5_onset_2026_08_26_07_35_21.wav"
+  ],
+  "n_train_samples": 322560,
+  "n_val_samples": 34320,
+  "n_test_samples": 46800
+}

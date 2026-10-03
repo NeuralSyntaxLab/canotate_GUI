@@ -8,11 +8,12 @@ import torch
 import numpy as np
 import json
 from bird_song_detector.model_zoo import ConvMLP
-from bird_song_detector.nn_segmentation.segmentation_utils import _merge_close_segments, _get_assential_info_from_filename
+from bird_song_detector.nn_segmentation.segmentation_utils import _get_assential_info_from_filename
 # Upstream pulls these from data_loader.py and training_loop.py, which drag in
 # h5py/pandas/sklearn/seaborn/tensorboard. Both functions are reproduced
 # verbatim in _helpers.py instead -- see PROVENANCE.md.
 from bird_song_detector._helpers import load_from_wav, normalize_per_segment
+from utils import song_wavs_under
 
 class InferenceToAnnotationData:
 
@@ -27,6 +28,15 @@ class InferenceToAnnotationData:
         inputs- inference_output: 1d array of binary values (0 or 1) indicating presence of bird song
                 fs: sampling frequency of the original audio file
         output- annotation_data: list of lists of size 3 where each inner list is [time_start, time_end, label]
+
+        Segments are returned unmerged. Every segment is still labeled 999 here
+        (classification hasn't run yet), so a gap-based merge at this point
+        cannot tell a real short pause between two distinct syllables from a
+        one-frame detector dropout inside a single syllable — both look like
+        "999 next to 999". Bridging small gaps safely requires the real
+        per-segment label, which only exists after classification (see
+        FullAnnotationPipeline.annotate_wav, which merges close same-label
+        segments post-classification instead).
         """
         annotation_data = []
         in_segment = False
@@ -48,7 +58,7 @@ class InferenceToAnnotationData:
             time_end = (len(inference_output) / fs) * segment_size
             annotation_data.append([time_start, time_end, 999])
 
-        return _merge_close_segments(annotation_data)
+        return annotation_data
 
     def _is_valid_date(self, date_parts):
         if len(date_parts) != 3:
@@ -73,22 +83,22 @@ class InferenceToAnnotationData:
         # This function will process each wav file in the directory, run inference using the model,
         # and save the results in the Keinan-based format annotation mat file in the output directory.
         # walk through wav_dir, for each wav file, run inference and save annotation data
-        all_wav_files = [os.path.join(r, f) for r, _, fs in os.walk(wav_dir) for f in fs if f.endswith('.wav')]
+        # Only wavs inside a folder named "wav" are recordings; syllable clips
+        # and exports elsewhere in the tree are not ours to annotate.
+        all_wav_files = song_wavs_under(wav_dir)
         print(f"Found {len(all_wav_files)} wav files to process in '{wav_dir}'")
         results = {}
-        for root, dirs, files in os.walk(wav_dir):
-            for file in files:
-                if file.endswith('.wav'):
-                    current_day = self._extract_date_from_filename(file)
-                    birds_name = file.split('_')[0]  # Assuming bird name is the first part of the filename
-                    if current_day not in results:
-                        results[current_day] = []
-                    wav_path = os.path.join(root, file)
-                    try:
-                        annotation_data = self.annotatate_data(wav_path)
-                        results[current_day].append({"file_name": file, "segments": annotation_data})
-                    except Exception as e:
-                        print(f"Error processing {file}: {e}")
+        for wav_path in all_wav_files:
+            file = os.path.basename(wav_path)
+            current_day = self._extract_date_from_filename(file)
+            birds_name = file.split('_')[0]  # Assuming bird name is the first part of the filename
+            if current_day not in results:
+                results[current_day] = []
+            try:
+                annotation_data = self.annotatate_data(wav_path)
+                results[current_day].append({"file_name": file, "segments": annotation_data})
+            except Exception as e:
+                print(f"Error processing {file}: {e}")
         # Save results to output directory
         if results:
             self.save_annotation_data(results, output_dir, birds_name)

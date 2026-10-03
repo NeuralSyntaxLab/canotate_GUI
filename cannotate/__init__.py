@@ -6,8 +6,12 @@ Modules
 cannotate_utils    : shared helpers, constants, pretty-sonogram
 navigator          : FullEntropyNavigator pop-up
 spectrogram_viewer : IntegratedSpectrogramViewer class
-dtw_suggestions    : DTW template logic
+spectrograms       : the viewer's display spectrogram
+template_store     : the per-bird template bank on disk
+xcorr_suggestions  : ranking a selection against that bank
 template_browser   : template concatenation browser
+error_correction   : outlier-phrase detection and correction browser
+xcorr              : cross-correlation scoring of phrases against templates
 """
 
 from .cannotate_utils import (          # noqa: F401
@@ -29,4 +33,7 @@ from .spectrogram_viewer import (                    # noqa: F401
     regenerate_disk_templates,
 )
 from .template_browser import open_template_browser  # noqa: F401
-from . import dtw_suggestions                        # noqa: F401
+from .error_correction import open_error_correction_browser  # noqa: F401
+from . import spectrograms                           # noqa: F401
+from . import template_store                         # noqa: F401
+from . import xcorr_suggestions                      # noqa: F401

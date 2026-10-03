@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Bootstrap that finds a usable Python and starts the Cannotate GUI.
 
 The point of this file is that nobody should have to open a terminal, activate

@@ -22,8 +22,11 @@ them is measured.
     <bird_folder>/<bird_name>_templates_YYYYMMDD.npz
 
 The newest date wins on load; ties break on mtime, and names that do not match
-the pattern are ignored.  A write never overwrites: a new dated file lands
-beside the old, which stays as history.
+the pattern are ignored.  A write never overwrites an *earlier day*: a new
+dated file lands beside the old, which stays as history.  A second write on
+the same day replaces that day's file — history is kept per day, not per
+write, and a folder accumulating a 1 MB file per template addition would be
+worse than no history at all.
 
 `xcorr.bank.Bank` gains provenance parallel to its existing `label` / `cols`
 arrays: `src_date`, `src_file`, `src_t0`, `src_t1` — the exact window a
@@ -104,7 +107,11 @@ path's whole purpose.
 * **Error correction**: the bank path initialises to the discovered file,
   and the "Templates…" picker stays as an override for experimental banks.
 * **Disk templates**: `regenerate_disk_templates` reads bank provenance and
-  re-reads the source wav, rather than a medoid dict.
+  re-reads the source wav, rather than a medoid dict.  The bank reaches every
+  one of these consumers through `template_store.as_display_templates`, which
+  presents it in the dict shape the DTW templates had — so the template
+  viewer, the PNG/WAV regeneration and the popup preview needed no changes
+  beyond the wording on screen.
 
 ## Removals
 
@@ -117,8 +124,11 @@ pickle layer, with `tests/test_templates_cache.py` and
 `tests/test_templates_fingerprint.py`.
 
 What survives is the spectrogram machinery the viewer's own display depends
-on — `compute_spectrogram_for_audio`, `compute_spectrogram_for_ranges`,
-`frame_times`, `_labelled_segments`, `plan_instance_selection`.  With DTW gone
+on — `extract_syllable_spectrogram`, `compute_spectrogram_for_audio`,
+`compute_spectrogram_for_ranges`, `frame_times`.  The annotation walk that
+chose which instances to read (`_labelled_segments`, `_candidate_pool`,
+`plan_instance_selection`) goes too: its only caller was the DTW template
+build, and `template_store.fit_pool` is the replacement.  With DTW gone
 the module name is a lie, so `cannotate/dtw_suggestions.py` becomes
 `cannotate/spectrograms.py` and its importers are updated.  No shim: nothing
 outside this repo imports it.
