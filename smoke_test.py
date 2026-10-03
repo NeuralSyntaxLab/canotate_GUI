@@ -195,6 +195,11 @@ def test_nn_inference_actually_runs():
     An absent optional backend is reported and skipped; one that is present
     but broken fails. Checking that every package is *installed* is the setup
     script's job, not this file's.
+
+    The song is synthetic tone bursts, not birdsong, and both segmentation
+    models score most of it above threshold. So the segment counts printed
+    here say nothing about accuracy -- they only show the models ran. Judging
+    a model's output needs real recordings.
     """
     import tempfile
 

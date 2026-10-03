@@ -21,6 +21,11 @@ trap 'rm -f "$SCRIPT"' EXIT
 # non-zero exit puts the tail of that log in a dialog. An earlier version sent
 # output to /dev/null, which meant a crash showed the user nothing at all --
 # never do that in a launcher whose whole point is that there is no terminal.
+#
+# It runs Cannotate.command rather than python3 directly, so both launchers
+# share one way of finding the interpreter. That matters on a Mac with no
+# system Python: Cannotate.command reads launcher.cfg with shell built-ins,
+# while "/usr/bin/env python3" would have failed before anything could say why.
 cat > "$SCRIPT" <<'APPLESCRIPT'
 on run
     set bundlePath to POSIX path of (path to me)
@@ -33,7 +38,7 @@ on run
         -- run far longer than that, so the timeout has to be raised.
         with timeout of 86400 seconds
             do shell script "cd " & quoted form of projectPath & ¬
-                " && /usr/bin/env python3 launch.py > " & quoted form of logPath & " 2>&1"
+                " && ./Cannotate.command > " & quoted form of logPath & " 2>&1"
         end timeout
     on error errMsg
         set logTail to ""
