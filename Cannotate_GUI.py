@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Cannotate_GUI.py  --  main entry-point for the bird-song annotation tool.
 
@@ -5,13 +6,16 @@ All heavy-lifting is delegated to extracted modules:
     cannotate_utils    - shared helpers, constants
     navigator          - FullEntropyNavigator
     spectrogram_viewer - IntegratedSpectrogramViewer
-    dtw_suggestions    - DTW template logic
+    template_store     - the per-bird syllable template bank
     template_browser   - template concatenation browser
 """
 import os
 import re
 import json
+import datetime
 import glob
+import queue
+import threading
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
@@ -22,14 +26,15 @@ import glob
 # -- project modules -------------------------------------------------------
 from cannotate import (
     clean_segments,
-    binary_to_segments,
-    segments_to_binary,
     FullEntropyNavigator,
     IntegratedSpectrogramViewer,
     open_template_browser,
+    open_error_correction_browser,
     regenerate_disk_templates,
 )
 from cannotate import read_wav, read_wav_channels
+from cannotate import template_store
+import utils
 from utils import (
     count_label_classes,
     merge_label_classes,
@@ -57,15 +62,146 @@ def _base_from_display(text):
     return text
 
 
-# How many appearances of each syllable are loaded to build its DTW template.
-# Templates are built from this many randomly-chosen instances per label instead
-# of from every annotation, so startup cost stays flat as the dataset grows.
-# Override with the CANNOTATE_TEMPLATE_INSTANCES environment variable.
-try:
-    TEMPLATE_INSTANCES_PER_SYLLABLE = int(
-        os.environ.get("CANNOTATE_TEMPLATE_INSTANCES", "60"))
-except ValueError:
-    TEMPLATE_INSTANCES_PER_SYLLABLE = 60
+def write_annotation_entry(db_data, date, file_name, segments, human_verified,
+                          annotation_file):
+    """Write one song's annotation into the bird's JSON, replacing any earlier one.
+
+    Shared by the viewer's Save button and by the viewer's close path, which
+    must agree: before this existed, saving lived only in the close path, so an
+    annotator's work stayed in memory until they shut the window.
+
+    The entry is looked up by file name rather than by an index captured
+    earlier. Marking a song "human verified" can create its entry while the
+    viewer is open, so any index taken before that goes stale.
+
+    ``segments`` must come from ``viewer.segments`` -- exact boundaries, labels
+    and AI flags. Never reconstruct them from the binary vectors
+    ``get_results`` returns: touching segments come back merged.
+    """
+    entries = db_data.setdefault(date, [])
+    idx = next((i for i, e in enumerate(entries)
+                if e.get("file_name") == file_name), None)
+    new_entry = {
+        "file_name": file_name,
+        HUMAN_VERIFIED_KEY: bool(human_verified),
+        "segments": clean_segments(segments),
+    }
+    if idx is None:
+        entries.append(new_entry)
+    else:
+        entries[idx] = new_entry
+    with open(annotation_file, "w") as f:
+        json.dump(db_data, f, indent=2)
+
+
+def run_template_fit(parent, bird_folder, db_data, date_to_wavs, on_done,
+                     force=False):
+    """Fit the template bank on a worker thread, behind a progress window.
+
+    Fitting reads wav files, which on a bird whose bank does not exist yet is
+    minutes of work.  Doing it inline would freeze the main window before it
+    ever appeared, so it runs off-thread and the window opens immediately;
+    suggestions simply say they are not ready until *on_done* fires.
+
+    The progress window only appears once the fit reports its first file, so
+    the ordinary case — a bank already on disk, nothing missing — costs no
+    visible flicker.
+    """
+    win = tk.Toplevel(parent)
+    win.title("Syllable templates")
+    win.withdraw()
+    win.resizable(False, False)
+    message = tk.Label(win, text="Reading annotated songs…", width=46,
+                       anchor="w")
+    message.pack(padx=12, pady=(12, 4))
+    bar = ttk.Progressbar(win, mode="determinate", length=340)
+    bar.pack(padx=12, pady=(0, 8))
+    cancelled = threading.Event()
+    tk.Button(win, text="Cancel", command=cancelled.set).pack(pady=(0, 10))
+    win.protocol("WM_DELETE_WINDOW", cancelled.set)
+
+    updates = queue.Queue()
+    state = {}
+
+    def progress(done, total):
+        updates.put((done, total))
+        return not cancelled.is_set()
+
+    def work():
+        try:
+            state["result"] = template_store.ensure(
+                bird_folder, db_data, date_to_wavs, force=force,
+                progress=progress)
+        except Exception as e:                                # noqa: BLE001
+            state["error"] = e
+        updates.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    def poll():
+        finished = False
+        while True:
+            try:
+                item = updates.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                finished = True
+                continue
+            done, total = item
+            if not win.winfo_viewable():
+                win.deiconify()
+            bar.config(maximum=max(total, 1), value=done)
+            message.config(text=f"Reading annotated songs… {done}/{total}")
+        if not finished:
+            parent.after(150, poll)
+            return
+        win.destroy()
+        if "error" in state:
+            messagebox.showerror(
+                "Syllable templates",
+                f"Could not build syllable templates:\n{state['error']}")
+            on_done(None)
+        else:
+            on_done(state["result"])
+
+    parent.after(150, poll)
+
+
+# Day folders are "<year>_<month>_<day>", optionally behind a bird-name prefix
+# ("lb4444_2024_06_15", "RO 2024-06-15", "RT10LO_2024_06_15"); '-', '_' and
+# spaces all separate. Bird names may end in a letter or a digit, so the year
+# is taken to start after a separator, after a letter, or at the very start —
+# never by splitting a run of digits, which would let a numeric name like
+# "RT10" bleed into the year.
+DATE_FOLDER_RE = re.compile(
+    r'(?:^|[-_\s]|(?<=[^\W\d_]))(\d{4})[-_\s](\d{2})[-_\s](\d{2})\s*$')
+
+
+def folder_date(folder_name):
+    """Return the ``YYYY-MM-DD`` a day-folder name encodes, or None if it is
+    not a day folder.
+
+    The date must be a real calendar date, so folders that merely end in three
+    number groups are not mistaken for days.
+    """
+    m = DATE_FOLDER_RE.search(folder_name.strip())
+    if not m:
+        return None
+    try:
+        return datetime.date(*(int(g) for g in m.groups())).isoformat()
+    except ValueError:
+        return None
+
+
+def collect_wavs(day_folder):
+    """All song wavs under *day_folder*, sorted by file name.
+
+    The rule for what counts as a song lives in :func:`utils.song_wavs_under`;
+    only the ordering is the GUI's own, because the song list is shown by
+    file name.
+    """
+    return sorted(utils.song_wavs_under(day_folder), key=os.path.basename)
 
 
 # -------------------------------------
@@ -149,27 +285,27 @@ def Cannotate():
                 json.dump(db_data, f, indent=2)
 
     # --- find date subfolders ---
-    date_pattern = re.compile(r'^\d{4}[-_]\d{2}[-_]\d{2}$')
+    # A day folder is named either "<year>_<month>_<day>" or the same date
+    # behind a bird-name prefix ("lb4444_2024_06_15", "lb 4444 2024-06-15").
+    # Separators may be '-', '_' or spaces. The folder name itself stays the
+    # key used in the annotation file, so existing annotations keep matching.
     date_folders = [
         d for d in os.listdir(bird_folder)
-        if os.path.isdir(os.path.join(bird_folder, d)) and date_pattern.match(d)
+        if os.path.isdir(os.path.join(bird_folder, d)) and folder_date(d)
     ]
     if not date_folders:
         messagebox.showinfo("Error", "No date subfolders found.")
         root.destroy()
         return
-    date_folders.sort()
+    # Chronological first, so mixed prefixes do not scramble the day order.
+    date_folders.sort(key=lambda d: (folder_date(d), d))
 
     # --- map date -> wavs ---
     date_to_wavs = {}
     for d in date_folders:
-        wav_folder = os.path.join(bird_folder, d, "chop_data", "wav")
-        if os.path.isdir(wav_folder):
-            wfs = [f for f in os.listdir(wav_folder)
-                   if f.lower().endswith(".wav") and not f.startswith("._")]
-            if wfs:
-                full_paths = [os.path.join(wav_folder, wf) for wf in sorted(wfs)]
-                date_to_wavs[d] = full_paths
+        wfs = collect_wavs(os.path.join(bird_folder, d))
+        if wfs:
+            date_to_wavs[d] = wfs
 
     # --- build global flattened song list ---
     global_songs = []
@@ -178,24 +314,41 @@ def Cannotate():
             global_songs.append((d, fp, os.path.basename(fp)))
     base_names_by_date = {d: [os.path.basename(p) for p in fps] for d, fps in date_to_wavs.items()}
 
-    # --- build global syllable templates ONCE at startup ---
-    # Only TEMPLATE_INSTANCES_PER_SYLLABLE randomly-chosen appearances of each
-    # syllable are loaded, and only the wav files holding them are read — the
-    # dataset as a whole is never loaded into memory, however large it grows.
-    # Backed by an on-disk cache next to the annotation file: on unchanged
-    # annotations (and source wavs) the templates load instantly with zero wav
-    # reads; otherwise they are rebuilt (streaming, one file at a time) and
-    # re-cached.
-    templates_cache_path = os.path.splitext(annotation_file)[0] + ".templates_cache.pkl"
-    global_syllable_templates = IntegratedSpectrogramViewer.build_global_syllable_templates_cached(
-        db_data, date_to_wavs, templates_cache_path,
-        template_cols=IntegratedSpectrogramViewer.TEMPLATE_COLS,
-        max_instances_per_label=TEMPLATE_INSTANCES_PER_SYLLABLE)
-    n_tmpl = len(global_syllable_templates)
-    if n_tmpl:
-        print(f"Built {n_tmpl} global syllable template(s): {sorted(global_syllable_templates.keys())}")
-    else:
-        print("No annotated syllables found yet — templates will be empty until annotations are made.")
+    # --- the syllable template bank ---
+    # One bank per bird at the dataset root.  It is loaded, not rebuilt: the
+    # fit that runs after the window opens touches only labels the bank does
+    # not hold yet, so every launch after the first reads the npz alone.
+    # ``bank_holder`` is what viewers are handed, and is refilled in place when
+    # a fit finishes so a window opened meanwhile starts suggesting.
+    bank_holder = {"bank": None}
+    open_viewers = []
+
+    def _adopt_bank(result):
+        """Publish a freshly fitted bank to every window that wants one."""
+        bank = result.bank if result is not None else None
+        bank_holder["bank"] = bank
+        for viewer in list(open_viewers):
+            try:
+                if viewer.root.winfo_exists():
+                    viewer.set_template_bank(bank)
+                    continue
+            except tk.TclError:
+                pass
+            open_viewers.remove(viewer)
+        if result is None:
+            return
+        print(f"[templates] {result.summary()}")
+        # Only when the bank actually changed: regenerating these re-reads a
+        # wav and draws a figure per label, which is not worth doing on the
+        # ordinary launch where nothing was fitted.
+        if result.written:
+            regenerate_disk_templates(
+                template_store.as_display_templates(bank, date_to_wavs),
+                os.path.join(bird_folder, "syllable_templates"))
+
+    def refit_templates(force=False):
+        run_template_fit(root, bird_folder, db_data, date_to_wavs, _adopt_bank,
+                         force=force)
 
     def global_index_of(date_str, base_name):
         for i, (d, _, bn) in enumerate(global_songs):
@@ -432,17 +585,10 @@ def Cannotate():
                     annotation_entry = (i, entry)
                     break
 
-        total_samples = len(y)
         if annotation_entry is None:
-            seg_vec, ann_vec = None, None
             existing_segments = []
         else:
-            existing_segs = annotation_entry[1]["segments"]
-            seg_vec, ann_vec = segments_to_binary(existing_segs, total_samples, fs)
-            existing_segments = existing_segs[:]
-
-        initial_verified = (annotation_entry is not None
-                            and is_human_verified(annotation_entry[1]))
+            existing_segments = annotation_entry[1]["segments"][:]
 
         def on_verified_change(value):
             """Persist the human-verification flag as soon as it is toggled."""
@@ -467,15 +613,34 @@ def Cannotate():
             refresh_counts()
             refresh_file_list_display()
 
+        def on_save(segments, human_verified):
+            """Write the annotation now, without waiting for the window to close.
+
+            Errors propagate to the viewer, which leaves its "Saved" label
+            blank rather than telling the annotator their work is safe when it
+            is not.
+            """
+            write_annotation_entry(db_data, date, file_base, segments,
+                                   human_verified, annotation_file)
+            refresh_counts()
+            refresh_file_list_display()
+
         viewer_win = tk.Toplevel(root)
         viewer = IntegratedSpectrogramViewer(viewer_win, bird_folder, annotation_callback=None,
                                                db_data=db_data, date_to_wavs=date_to_wavs,
-                                               global_syllable_templates=global_syllable_templates,
-                                               verified_callback=on_verified_change)
-        viewer.load_existing_data(y, fs, file_base, seg_vec, ann_vec,
+                                               template_bank=bank_holder["bank"],
+                                               verified_callback=on_verified_change,
+                                               template_refresh_callback=lambda: refit_templates(force=True),
+                                               save_callback=on_save)
+        open_viewers.append(viewer)
+        viewer.load_existing_data(y, fs, file_base,
                                   existing_segments=existing_segments,
                                   noise_audio=noise_audio)
-        viewer.set_human_verified(initial_verified)
+        # Opening a file means a human is looking at it, so the window starts
+        # marked verified. Nothing is written yet: set_human_verified does not
+        # fire the callback, so the flag only reaches the JSON when the viewer
+        # is closed (or if the user toggles it off/on by hand).
+        viewer.set_human_verified(True)
         palette = viewer.palette
 
         def on_navigator_select(t0, t1):
@@ -497,30 +662,14 @@ def Cannotate():
         except Exception:
             pass
 
-        res_file, _, _, res_seg_vec, res_ann_vec = viewer.get_results()
-        if res_seg_vec is None or res_ann_vec is None:
+        res_file, _, _, _, _ = viewer.get_results()
+        if res_file is None:
             messagebox.showerror("Error", "No annotation was made.")
             return
-        # Use viewer.segments directly so AI flags (4th element) are preserved.
-        segs = viewer.segments if viewer.segments else binary_to_segments(res_seg_vec, res_ann_vec, fs)
-        # Look the entry up again rather than reusing the index captured before
-        # the viewer opened: toggling "human verified" may have created it.
-        # The viewer holds the authoritative flag, since that is where the user
-        # last set it.
-        entries = db_data.setdefault(date, [])
-        idx = next((i for i, e in enumerate(entries)
-                    if e.get("file_name") == res_file), None)
-        new_entry = {
-            "file_name": res_file,
-            HUMAN_VERIFIED_KEY: bool(viewer.human_verified),
-            "segments": clean_segments(segs),
-        }
-        if idx is None:
-            entries.append(new_entry)
-        else:
-            entries[idx] = new_entry
-        with open(annotation_file, "w") as f:
-            json.dump(db_data, f, indent=2)
+        # The viewer holds the authoritative flag, since that is where the
+        # user last set it.
+        write_annotation_entry(db_data, date, res_file, viewer.segments,
+                               viewer.human_verified, annotation_file)
         messagebox.showinfo("Saved", f"Annotations saved for {file_base}")
         refresh_counts()
         refresh_file_list_display()
@@ -588,27 +737,19 @@ def Cannotate():
             with open(annotation_file, "w") as f:
                 json.dump(db_data, f, indent=2)
 
-            # Rebuild templates so the class (spectrogram) and audio templates
-            # reflect the merged labels: the target's medoid is recomputed over
-            # all merged segments, and orphaned source-label templates are
-            # dropped. Mutate the shared dict in place so viewers keep working.
-            new_templates = IntegratedSpectrogramViewer.build_global_syllable_templates_cached(
-                db_data, date_to_wavs, templates_cache_path,
-                template_cols=IntegratedSpectrogramViewer.TEMPLATE_COLS,
-                max_instances_per_label=TEMPLATE_INSTANCES_PER_SYLLABLE)
-            global_syllable_templates.clear()
-            global_syllable_templates.update(new_templates)
-            template_dir = os.path.join(bird_folder, "syllable_templates")
-            regenerate_disk_templates(global_syllable_templates, template_dir)
-
             messagebox.showinfo(
                 "Merge Labels",
                 f"Rewrote {n_changed} segment(s) to label {target!r}.\n"
-                f"Templates rebuilt: {sorted(global_syllable_templates.keys())}",
+                "Refitting the syllable templates now — the merged class is "
+                "cut afresh and the templates of the labels that no longer "
+                "exist are dropped.",
                 parent=win
             )
             refresh_counts()
             win.destroy()
+            # A forced refit, because merging is exactly the case where an
+            # existing template must be replaced rather than kept.
+            refit_templates(force=True)
 
         tk.Button(win, text="Apply Merge", command=apply_merge, fg="black").pack(pady=8)
 
@@ -677,18 +818,31 @@ def Cannotate():
         row=5, column=0, columnspan=2, pady=4
     )
 
-    tk.Button(root, text="Merge Label Classes", command=_open_merge_labels, fg="black").grid(
+    # ----- Error correction (delegated to error_correction module) -----
+    def _open_error_correction():
+        open_error_correction_browser(
+            root, db_data, date_to_wavs, annotation_file, refresh_counts,
+            bird_folder=bird_folder)
+
+    tk.Button(root, text="Error Correction", command=_open_error_correction, fg="black").grid(
         row=6, column=0, columnspan=2, pady=4
+    )
+
+    tk.Button(root, text="Merge Label Classes", command=_open_merge_labels, fg="black").grid(
+        row=7, column=0, columnspan=2, pady=4
     )
 
     tk.Button(root, text="Remove Entry from Annotation File",
               command=_remove_file_entry, fg="#B00020").grid(
-        row=7, column=0, columnspan=2, pady=4
+        row=8, column=0, columnspan=2, pady=4
     )
 
     tk.Button(root, text="Open Annotation", command=open_annotation, fg="black").grid(
         row=4, column=0, columnspan=2, pady=10
     )
+    # Fit any label the bank is missing, once the window is up.
+    root.after(200, refit_templates)
+
     root.mainloop()
 
 if __name__ == "__main__":

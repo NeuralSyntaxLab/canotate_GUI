@@ -4,6 +4,7 @@ IntegratedSpectrogramViewer — the main spectrogram annotation window.
 This module contains the full viewer class; DTW helpers are delegated to
 ``spectrograms`` and utilities to ``cannotate_utils``.
 """
+import datetime
 import os
 import re
 import tempfile
@@ -204,8 +205,15 @@ class IntegratedSpectrogramViewer:
 
     def __init__(self, master, bird_folder=None, annotation_callback=None,
                  db_data=None, date_to_wavs=None, template_bank=None,
-                 verified_callback=None, template_refresh_callback=None):
+                 verified_callback=None, template_refresh_callback=None,
+                 save_callback=None):
         self.annotation_callback = annotation_callback
+        # Called with (segments, human_verified) when the user presses Save.
+        # Like verified_callback, this exists because the viewer never touches
+        # the annotation file itself -- whoever owns the file decides how to
+        # write it. Without a callback there is nobody to save to, so the
+        # button is disabled rather than silently doing nothing.
+        self.save_callback = save_callback
         # Called with the new boolean whenever the user toggles "human
         # verified".  The viewer itself never touches the annotation file; the
         # owner of the file decides how to persist the flag.
@@ -249,6 +257,17 @@ class IntegratedSpectrogramViewer:
                                       font=("Arial", 10, "bold"))
         self.btn_verified.pack(side=tk.LEFT, padx=10, pady=3)
         self._update_verified_button()
+
+        # Saving used to happen only when this window closed, so a long
+        # session lived entirely in memory until then.
+        self.btn_save = tk.Button(top_bar, text="\U0001F4BE Save",
+                                  command=self.save_now,
+                                  font=("Arial", 10, "bold"),
+                                  state=tk.NORMAL if save_callback else tk.DISABLED)
+        self.btn_save.pack(side=tk.LEFT, padx=(0, 6), pady=3)
+        self.lbl_save_status = tk.Label(top_bar, text="", font=("Arial", 9),
+                                        fg="#2e7d32")
+        self.lbl_save_status.pack(side=tk.LEFT)
 
         # ── Matplotlib figure ────────────────────────────────
         self.frame = tk.Frame(self.root)
@@ -383,6 +402,11 @@ class IntegratedSpectrogramViewer:
         self.root.bind("g", lambda e: self.activate_auto_suggest_mode())
         self.root.bind("p", lambda e: self.prune_mismatched_labels())
         self.root.bind("v", self.toggle_human_verified)
+        # A bare "s" is already segment mode, so Save takes the modifier
+        # form. Both are bound: Cmd-S is the reflex on macOS, Ctrl-S on
+        # Windows, and the same window ships to both.
+        self.root.bind("<Control-s>", lambda e: self.save_now())
+        self.root.bind("<Command-s>", lambda e: self.save_now())
         self.root.bind("x", self.accept_suggestions_and_classify)
         self.root.bind("<Up>", lambda e: self.increase_threshold())
         self.root.bind("<Down>", lambda e: self.decrease_threshold())
@@ -505,6 +529,22 @@ class IntegratedSpectrogramViewer:
     # ================================================================
     # Human verification flag
     # ================================================================
+
+    def save_now(self):
+        """Hand the current annotation to whoever owns the annotation file.
+
+        Bound to the Save button and to Ctrl/Cmd-S. The status label is only
+        updated *after* the callback returns: a save that raised must not leave
+        the word "Saved" on screen, because the annotator would then believe
+        their work is on disk when it is not. The exception is deliberately
+        allowed to propagate so the owner can report it the way it reports its
+        other write failures.
+        """
+        if self.save_callback is None:
+            return
+        self.save_callback(self.segments, self.human_verified)
+        self.lbl_save_status.config(
+            text=f"Saved {datetime.datetime.now().strftime('%H:%M:%S')}")
 
     def _update_verified_button(self):
         """Repaint the toggle so it reflects ``self.human_verified``."""
