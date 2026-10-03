@@ -167,6 +167,109 @@ def test_viewer_builds_its_widgets():
     return True
 
 
+def _synthetic_song(path, fs=44100, seconds=2.0):
+    """Four tone bursts on a quiet floor — enough for a segmenter to find edges."""
+    import numpy as np
+    from scipy.io import wavfile
+
+    t = np.arange(0, seconds, 1.0 / fs)
+    y = np.zeros_like(t)
+    for start, stop, f0 in [(0.2, 0.5, 3000), (0.7, 1.0, 5000),
+                            (1.2, 1.5, 4000), (1.7, 1.9, 6000)]:
+        m = (t >= start) & (t < stop)
+        y[m] += np.sin(2 * np.pi * f0 * t[m]) * np.hanning(int(m.sum()))
+    rng = np.random.default_rng(13)
+    y = y + rng.normal(0, 0.01, y.shape)
+    wavfile.write(path, fs, (y * 8000).astype(np.int16))
+    return fs
+
+
+def test_nn_inference_actually_runs():
+    """Segmentation and classification produce output, not just enabled buttons.
+
+    ``test_viewer_builds_its_widgets`` only proves the NN buttons are not
+    greyed out. That passes on a machine where torch imports but the models
+    are unreadable or the wrong architecture, which is exactly the state a
+    half-finished setup leaves behind. This runs the models.
+
+    An absent optional backend is reported and skipped; one that is present
+    but broken fails. Checking that every package is *installed* is the setup
+    script's job, not this file's.
+    """
+    import tempfile
+
+    try:
+        import torch
+    except ImportError as e:
+        print(f"skip: no torch, NN features are unavailable ({e})")
+        return True
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+    import numpy as np
+    from scipy.io import wavfile
+
+    from bird_song_detector.model_zoo import ConvMLP
+    from bird_song_detector.nn_segmentation import InferenceToAnnotationData
+    from cannotate.cannotate_utils import NN_WEIGHTS_DIR, ONNX_DEFAULT_WEIGHTS
+    from cannotate.onnx_segmentation import OnnxSegmentationModel
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = os.path.join(tmp, "bird_0001_2024_07_05_06_58_44.wav")
+        fs = _synthetic_song(wav_path)
+        device = torch.device("cpu")
+
+        # ── PyTorch segmentation weights ──────────────────────────
+        pth = os.path.join(NN_WEIGHTS_DIR, "weights_best_epoch4_vacc95.pth")
+        if not os.path.isfile(pth):
+            return _fail(f"segmentation weights missing: {pth}")
+        try:
+            model = ConvMLP(input_size=256)
+            model.load_state_dict(torch.load(pth, map_location=device))
+            segments = InferenceToAnnotationData(model, device).annotatate_data(wav_path)
+        except Exception as e:
+            return _fail(f"PyTorch segmentation failed: {e!r}")
+        if not isinstance(segments, list):
+            return _fail(f"segmentation returned {type(segments).__name__}, expected list")
+        print(f"ok: PyTorch segmentation ran ({len(segments)} segments)")
+
+        # ── ONNX segmentation weights ─────────────────────────────
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError as e:
+            print(f"skip: no onnxruntime, .onnx weights unavailable ({e})")
+        else:
+            if not os.path.isfile(ONNX_DEFAULT_WEIGHTS):
+                return _fail(f"ONNX weights missing: {ONNX_DEFAULT_WEIGHTS}")
+            try:
+                onnx_model = OnnxSegmentationModel(ONNX_DEFAULT_WEIGHTS)
+                onnx_segments = InferenceToAnnotationData(
+                    onnx_model, device).annotatate_data(wav_path)
+            except Exception as e:
+                return _fail(f"ONNX segmentation failed: {e!r}")
+            print(f"ok: ONNX segmentation ran ({len(onnx_segments)} segments)")
+
+        # ── Phrase classifier ─────────────────────────────────────
+        from classification_model.segment_classifier import SegmentClassifier
+        model_dir = os.path.join(PROJECT_ROOT, "classification_model",
+                                 "conv1d_phrase_model")
+        if not os.path.isdir(model_dir):
+            return _fail(f"classification model missing: {model_dir}")
+        try:
+            clf = SegmentClassifier.load(model_dir, device=device, verbose=False)
+            _, audio = wavfile.read(wav_path)
+            preds = clf.classify_segments(
+                np.asarray(audio, dtype=np.float32), fs,
+                [(0.2, 0.5, 999), (0.7, 1.0, 999)])
+        except Exception as e:
+            return _fail(f"phrase classification failed: {e!r}")
+        labels = [p.label for p in preds]
+        if len(labels) != 2:
+            return _fail(f"classifier returned {len(labels)} predictions, expected 2")
+        print(f"ok: phrase classifier ran (labels {labels})")
+
+    return True
+
+
 def main():
     tests = [
         test_gui_imports_headlessly,
@@ -175,6 +278,7 @@ def main():
         test_model_files_are_present,
         test_nn_optionality_is_wired,
         test_viewer_builds_its_widgets,
+        test_nn_inference_actually_runs,
     ]
     results = [t() for t in tests]
     passed, total = sum(1 for r in results if r), len(results)
