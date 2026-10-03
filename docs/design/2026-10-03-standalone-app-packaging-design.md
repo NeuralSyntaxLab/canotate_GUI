@@ -2,6 +2,33 @@
 
 *2026-10-03*
 
+> **Superseded on 2026-10-03, before any of it was built.** Kept for the
+> measurements and for the bug it turned up.
+>
+> This design assumed the app would be sent to someone unreachable, which is
+> what makes a self-contained bundle worth its cost. It is not: there is one
+> annotator, on one Mac, who can be set up in person. Two facts then undid it.
+>
+> Dropping torch was the whole point of the ONNX-only plan, and the plan was
+> to save download size. But conda-forge's CPU `pytorch` build is 26 MB, not
+> the 328 MB the pip wheel unpacks to, because it carries no CUDA payload. A
+> complete environment — torch, onnxruntime, scipy, the lot — is a 249 MB
+> download, which is what the ONNX-only *bundle* was estimated at. The size
+> argument for giving up PyTorch evaporated once the right number was
+> measured.
+>
+> And new `.pth` weights get trained regularly here, so ONNX-only would have
+> taxed every retrain with an export step, permanently, to buy nothing.
+>
+> What was built instead: `setup/install_mac.command`, which bootstraps
+> micromamba and builds that environment on the annotator's Mac. See
+> [`INSTALL.md`](../INSTALL.md).
+>
+> The double-normalization bug this document describes in "Fixing a
+> double-normalization bug on the way" was real and is fixed — it had nothing
+> to do with packaging. The size table below is accurate but measures pip
+> wheels, which is the wrong package source for this project.
+
 ## Goal
 
 Ship Cannotate as a self-contained application for macOS and Windows that a

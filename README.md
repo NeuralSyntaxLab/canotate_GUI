@@ -8,6 +8,28 @@ This is the annotation tool on its own. It was extracted from the
 `birdsong-preprocessing-gui` project, which also carried training scripts, UMAP
 workflows, ViT experiments and format converters — none of which are here.
 
+## Setting it up on a machine that has no Python
+
+Double-click `setup/install_mac.command` (macOS) or
+`setup/install_windows.bat` (Windows).
+
+It builds Cannotate a private Python under `~/.cannotate` —
+`%LOCALAPPDATA%\Cannotate` on Windows — with everything the tool needs,
+including torch and onnxruntime, so the NN buttons work. It bootstraps
+micromamba, so no Python has to exist beforehand, nothing goes on PATH, and no
+administrator rights are needed. About 250 MB to download; a few minutes.
+
+Running it again rebuilds the environment from scratch, which is the fix when
+something breaks. It ends by running [`smoke_test.py`](smoke_test.py), so a
+successful run means the models actually load and run, not just that the files
+copied.
+
+[`docs/INSTALL.md`](docs/INSTALL.md) is the same thing written for someone who
+does not program — that is the one to send to an annotator.
+
+If you already have a conda environment with the right packages, you do not
+need any of this; `launch.py` will find it.
+
 ## Starting it
 
 **Do not open a terminal.** Double-click one of these:
@@ -20,12 +42,18 @@ workflows, ViT experiments and format converters — none of which are here.
 The console-window versions do the same thing but leave a window open showing
 progress and errors — useful when something is not working.
 
-All four run [`launch.py`](launch.py), which finds a Python with the right
-packages, remembers it in `launcher.cfg`, and starts the GUI. The first launch
-takes a few seconds while it searches; later ones are immediate.
+All four first look in `launcher.cfg` for an interpreter — the one the setup
+script recorded — and run it directly. They read that file with shell
+built-ins rather than Python, because on a machine with no Python there is
+nothing to read it with. On macOS this matters more than it looks:
+`/usr/bin/python3` exists on every Mac but is a stub that prompts to install
+the Command Line Tools.
 
-If nothing suitable is found, a dialog tells you exactly what is missing and
-gives you the `pip install` line to fix it.
+Failing that, they fall back to a Python on PATH and let
+[`launch.py`](launch.py) search the machine, remembering what it finds in
+`launcher.cfg`.
+
+If nothing suitable is found, you are pointed at the setup script above.
 
 > **macOS, first run:** right-click `Cannotate.app` → **Open** → **Open**.
 > Gatekeeper blocks double-clicking an unsigned app the first time only.
@@ -43,6 +71,9 @@ python = /opt/anaconda3/envs/moove_env/bin/python
 everything except `launcher.cfg`.
 
 ## Requirements
+
+The setup script above installs all of these, so this section is only for
+setting an environment up by hand.
 
 Required — the GUI will not start without them:
 
@@ -63,6 +94,10 @@ torch  onnxruntime  scikit-learn  pandas
 Without them the tool opens normally and every manual feature works. The three
 NN buttons (**Run NN Segmentation**, **Classify 999 Segments**, **Full Auto
 Annotate**) are greyed out, with a note saying why.
+
+Install torch from conda-forge rather than pip where you can: the CPU build is
+26 MB against the 328 MB the pip wheel unpacks to, because it carries no CUDA
+payload. On a Mac none of that payload could ever be used anyway.
 
 ```
 pip install -r requirements.txt
