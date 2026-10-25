@@ -5,6 +5,7 @@ This module contains the full viewer class; DTW helpers are delegated to
 ``spectrograms`` and utilities to ``cannotate_utils``.
 """
 import datetime
+import json
 import os
 import re
 import tempfile
@@ -60,6 +61,38 @@ CLASSIFICATION_MODEL_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), os.pardir,
     "classification_model", "conv1d_phrase_model",
 )
+
+# The folder picked with "Set as default" is remembered here, next to the code,
+# and overrides the shipped location until it is changed again.
+_SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.pardir,
+    "cannotate_settings.json",
+)
+
+
+def _load_default_clf_model_dir():
+    """Saved default classifier folder, falling back to the shipped one."""
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as f:
+            saved = json.load(f).get("classification_model_dir")
+        if saved:
+            return saved
+    except (OSError, ValueError, AttributeError):
+        pass
+    return CLASSIFICATION_MODEL_DIR
+
+
+def _save_default_clf_model_dir(path):
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data["classification_model_dir"] = path
+    with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 def _prefix(extra_msg, msg):
@@ -152,7 +185,7 @@ def _write_wav_template(annot_id, tmpl, template_dir, pad=0.05):
         print(f"Failed to regenerate audio template for {annot_id}: {e}")
 
 
-def regenerate_disk_templates(templates, template_dir, pad=0.05):
+def regenerate_disk_templates(templates, template_dir, pad=0.05, keep=()):
     """Sync the on-disk syllable templates with a freshly built ``templates`` dict.
 
     Removes orphaned ``syllable_*.png`` / ``syllable_*.wav`` files for labels
@@ -160,15 +193,18 @@ def regenerate_disk_templates(templates, template_dir, pad=0.05):
     template for every surviving label from the window its template was cut
     from.
 
-    Call this after merging label classes so the class/audio templates on disk
-    reflect the new set of labels. ``templates`` is the display dict returned
-    by :func:`cannotate.template_store.as_display_templates`.
+    Call this after merging label classes or recalculating templates, so the
+    class/audio templates on disk are the ones suggestions are scored against.
+    ``templates`` is the display dict returned by
+    :func:`cannotate.template_store.as_display_templates`.  Labels in *keep*
+    still exist but have no bank template yet (too few segments); their
+    annotation-time previews are left alone rather than deleted.
     """
     if not template_dir or not os.path.isdir(template_dir):
         return
 
     valid_ids = set()
-    for annot_id in templates:
+    for annot_id in list(templates) + list(keep):
         try:
             valid_ids.add(int(annot_id))
         except (TypeError, ValueError):
@@ -384,32 +420,36 @@ class IntegratedSpectrogramViewer:
                   font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
 
         # ── Key bindings ─────────────────────────────────────
-        self.root.bind("<Left>", lambda e: self.move_window(-1))
-        self.root.bind("<Right>", lambda e: self.move_window(1))
-        self.root.bind_all("<BackSpace>", self.delete_last_segment)
-        self.root.bind("r", lambda e: self.activate_segment_region_mode())
-        self.root.bind("s", lambda e: self.activate_segment_mode())
-        self.root.bind("d", lambda e: self.activate_delete_region_mode())
-        self.root.bind("m", lambda e: self.activate_move_boundaries())
-        self.root.bind("a", self.toggle_annotate_region_mode)
-        self.root.bind("i", self.zoom_in)
-        self.root.bind("o", self.zoom_out)
-        self.root.bind("h", lambda e: self.toggle_suggestions())
-        self.root.bind("j", lambda e: self.activate_join_mode())
-        self.root.bind("c", self.activate_entropy_replace_mode)
-        self.root.bind("w", self.replace_with_all_entropy_suggestions)
-        self.root.bind("t", lambda e: self.activate_suggest_mode())
-        self.root.bind("g", lambda e: self.activate_auto_suggest_mode())
-        self.root.bind("p", lambda e: self.prune_mismatched_labels())
-        self.root.bind("v", self.toggle_human_verified)
+        # Bound on this window only, and ignored while a text field has
+        # focus: Backspace in the label entry once deleted the last segment
+        # (it was bound application-wide), and typing a "d" there switched to
+        # delete-region mode.
+        self._bind_shortcut("<Left>", lambda e: self.move_window(-1))
+        self._bind_shortcut("<Right>", lambda e: self.move_window(1))
+        self._bind_shortcut("<BackSpace>", self.delete_last_segment)
+        self._bind_shortcut("r", lambda e: self.activate_segment_region_mode())
+        self._bind_shortcut("s", lambda e: self.activate_segment_mode())
+        self._bind_shortcut("d", lambda e: self.activate_delete_region_mode())
+        self._bind_shortcut("m", lambda e: self.activate_move_boundaries())
+        self._bind_shortcut("a", self.toggle_annotate_region_mode)
+        self._bind_shortcut("i", self.zoom_in)
+        self._bind_shortcut("o", self.zoom_out)
+        self._bind_shortcut("h", lambda e: self.toggle_suggestions())
+        self._bind_shortcut("j", lambda e: self.activate_join_mode())
+        self._bind_shortcut("c", self.activate_entropy_replace_mode)
+        self._bind_shortcut("w", self.replace_with_all_entropy_suggestions)
+        self._bind_shortcut("t", lambda e: self.activate_suggest_mode())
+        self._bind_shortcut("g", lambda e: self.activate_auto_suggest_mode())
+        self._bind_shortcut("p", lambda e: self.prune_mismatched_labels())
+        self._bind_shortcut("v", self.toggle_human_verified)
         # A bare "s" is already segment mode, so Save takes the modifier
         # form. Both are bound: Cmd-S is the reflex on macOS, Ctrl-S on
         # Windows, and the same window ships to both.
         self.root.bind("<Control-s>", lambda e: self.save_now())
         self.root.bind("<Command-s>", lambda e: self.save_now())
-        self.root.bind("x", self.accept_suggestions_and_classify)
-        self.root.bind("<Up>", lambda e: self.increase_threshold())
-        self.root.bind("<Down>", lambda e: self.decrease_threshold())
+        self._bind_shortcut("x", self.accept_suggestions_and_classify)
+        self._bind_shortcut("<Up>", lambda e: self.increase_threshold())
+        self._bind_shortcut("<Down>", lambda e: self.decrease_threshold())
 
         self.join_mode = False
         self.suggest_mode = False
@@ -486,11 +526,13 @@ class IntegratedSpectrogramViewer:
 
         tk.Label(btn_frame4, text="Classifier model:").pack(side=tk.LEFT, padx=(5, 2))
         self.clf_model_var = tk.StringVar(
-            value=os.path.normpath(CLASSIFICATION_MODEL_DIR))
+            value=os.path.normpath(_load_default_clf_model_dir()))
         tk.Entry(btn_frame4, textvariable=self.clf_model_var,
                  width=50).pack(side=tk.LEFT, padx=2)
         tk.Button(btn_frame4, text="Browse…", fg="black",
                   command=self._browse_clf_model).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame4, text="Set as default", fg="black",
+                  command=self._set_default_clf_model).pack(side=tk.LEFT, padx=2)
 
         tk.Label(btn_frame4, text="Confidence:").pack(side=tk.LEFT, padx=(10, 2))
         self.clf_confidence_var = tk.DoubleVar(value=0.5)
@@ -726,10 +768,27 @@ class IntegratedSpectrogramViewer:
     def _browse_clf_model(self):
         path = filedialog.askdirectory(
             title="Select classification model folder",
-            initialdir=os.path.dirname(os.path.normpath(CLASSIFICATION_MODEL_DIR)),
+            initialdir=os.path.dirname(
+                os.path.normpath(self.clf_model_var.get().strip()
+                                 or CLASSIFICATION_MODEL_DIR)),
         )
         if path:
             self.clf_model_var.set(path)
+
+    def _set_default_clf_model(self):
+        """Make the folder in the entry the default from now on."""
+        path = os.path.normpath(self.clf_model_var.get().strip())
+        if not os.path.isdir(path):
+            messagebox.showwarning(
+                "Classifier model", "That is not an existing folder.")
+            return
+        try:
+            _save_default_clf_model_dir(path)
+        except OSError as e:
+            messagebox.showerror("Classifier model", f"Could not save: {e}")
+            return
+        messagebox.showinfo(
+            "Classifier model", f"Default classifier model set to:\n{path}")
 
     def classify_unlabeled_segments(self, extra_msg=None):
         """Label every unlabeled (999) segment with the trained 1D-CNN.
@@ -2027,6 +2086,26 @@ class IntegratedSpectrogramViewer:
     # Misc event handlers
     # ================================================================
 
+    _TEXT_INPUT_CLASSES = ("Entry", "TEntry", "Text", "Spinbox",
+                           "TSpinbox", "TCombobox")
+
+    @classmethod
+    def _is_typing(cls, event):
+        """True if *event* is a key press meant for a text field."""
+        widget = getattr(event, "widget", None)
+        try:
+            return widget.winfo_class() in cls._TEXT_INPUT_CLASSES
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _bind_shortcut(self, sequence, handler):
+        """Bind a viewer shortcut that stays out of the way of text fields."""
+        def on_key(event):
+            if self._is_typing(event):
+                return None
+            return handler(event)
+        self.root.bind(sequence, on_key)
+
     def delete_last_segment(self, event=None):
         if self.segments:
             self.segments.pop()
@@ -2092,6 +2171,21 @@ class IntegratedSpectrogramViewer:
             return
 
         # ── Spectrogram template (PNG) ───────────────────────────────
+        # A label the bank already holds gets the bank's template, so the
+        # preview on disk is what suggestions are scored against rather than
+        # whichever rendition happened to be annotated first.
+        bank_tmpl = self._bank_template_for(annot)
+        if bank_tmpl is not None:
+            for ext, write in (("png", lambda: _write_png_template(
+                                    annot, bank_tmpl, self.template_dir,
+                                    self.palette)),
+                               ("wav", lambda: _write_wav_template(
+                                    annot, bank_tmpl, self.template_dir))):
+                path = os.path.join(self.template_dir, f"syllable_{annot}.{ext}")
+                if not os.path.exists(path):
+                    write()
+            return
+
         template_filename = f"syllable_{annot}.png"
         template_filepath = os.path.join(self.template_dir, template_filename)
         if os.path.exists(template_filepath):
@@ -2131,6 +2225,16 @@ class IntegratedSpectrogramViewer:
         # Saved so the syllable can be *played back* during later
         # annotation sessions to tell similar syllables apart by ear.
         self.save_audio_template_for_annotation(annot, t_start, t_end)
+
+    def _bank_template_for(self, annot):
+        """The display template of *annot* if the bank holds one, else ``None``."""
+        try:
+            tmpl = self.syllable_templates.get(int(annot))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(tmpl, dict) or tmpl.get("spec") is None:
+            return None
+        return tmpl
 
     def save_audio_template_for_annotation(self, annot, t_start, t_end,
                                            pad=0.05):
@@ -2466,6 +2570,10 @@ class IntegratedSpectrogramViewer:
         result = template_store.ensure(self.bird_folder, self.db_data,
                                        self.date_to_wavs, force=True)
         self.set_template_bank(result.bank)
+        # The PNG/WAV the annotator checks a suggestion against must be the
+        # template it was scored with, not an older one.
+        regenerate_disk_templates(self.syllable_templates, self.template_dir,
+                                  keep=result.pending)
         messagebox.showinfo("Recalculate Templates", result.summary())
 
     # ================================================================
@@ -2625,10 +2733,14 @@ class IntegratedSpectrogramViewer:
     def _show_suggestions_popup(self, t_start, t_end, suggestions):
         top = tk.Toplevel(self.root)
         top.title("Syllable Suggestions")
-        top.geometry("700x520")
+        top.geometry("700x560")
 
-        # Query preview
-        query_spec = self._extract_syllable_spectrogram(t_start, t_end)
+        # Query preview, drawn from the same band-limited spectrogram the
+        # templates live on, so the two images can be compared side by side.
+        S, T = self._scoring_view()
+        query_spec = SuggestionEngine.query_patch(S, T, t_start, t_end)
+        if query_spec is None:
+            query_spec = self._extract_syllable_spectrogram(t_start, t_end)
         fig_q = plt.Figure(figsize=(6, 1.5), dpi=100)
         ax_q = fig_q.add_subplot(111)
         if query_spec is not None:
@@ -2686,6 +2798,56 @@ class IntegratedSpectrogramViewer:
             canvas_t.draw()
 
         tree.bind('<<TreeviewSelect>>', on_tree_select)
+        first = tree.get_children()
+        if first:
+            tree.selection_set(first[0])
+            on_tree_select()
+
+        # ── Listen before agreeing ──
+        # The template's audio is the window it was cut from — the same
+        # rendition shown above — so ear and eye check the same thing.
+        def selected_template():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("Syllable Suggest",
+                                       "Select a suggestion first.", parent=top)
+                return None
+            return self.syllable_templates.get(int(tree.item(sel[0], 'values')[1]))
+
+        def play_template(speed=1.0):
+            tmpl_data = selected_template()
+            if tmpl_data is None:
+                return
+            seg = (self._load_template_audio(tmpl_data)
+                   if isinstance(tmpl_data, dict) else None)
+            if seg is None:
+                messagebox.showinfo("Syllable Suggest",
+                                    "Audio for this template is unavailable.",
+                                    parent=top)
+                return
+            self._play_audio_segment(seg[0], seg[1], speed=speed)
+
+        def play_selection(speed=1.0):
+            if getattr(self, "audio", None) is None or not self.fs:
+                return
+            i0 = max(0, int(t_start * self.fs))
+            i1 = min(len(self.audio), int(t_end * self.fs))
+            if i1 > i0:
+                self._play_audio_segment(np.asarray(self.audio[i0:i1]),
+                                         self.fs, speed=speed)
+
+        play_frame = tk.Frame(top)
+        play_frame.pack(fill='x', padx=5)
+        tk.Button(play_frame, text="▶ Selection",
+                  command=play_selection).pack(side=tk.LEFT, padx=3)
+        tk.Button(play_frame, text="▶ Selection (slow)",
+                  command=lambda: play_selection(self.slowmo_speed)
+                  ).pack(side=tk.LEFT, padx=3)
+        tk.Button(play_frame, text="▶ Template",
+                  command=play_template).pack(side=tk.LEFT, padx=(12, 3))
+        tk.Button(play_frame, text="▶ Template (slow)",
+                  command=lambda: play_template(self.slowmo_speed)
+                  ).pack(side=tk.LEFT, padx=3)
 
         def assign_selected():
             sel = tree.selection()

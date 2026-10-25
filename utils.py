@@ -5,6 +5,7 @@ file that will contain utility function for technical function such as convertin
 import os
 import json
 import re
+import datetime
 import scipy.io as sio
 from collections import defaultdict
 
@@ -58,6 +59,108 @@ def ensure_human_verified_field(annotation, default=False):
     return n_added
 
 
+# ---------------------------------------------------------------------------
+# Day folders and the date keys of the annotation file
+#
+# A bird's recordings are split into one folder per day, named either
+# "<year>_<month>_<day>" or the same date behind a bird-name prefix
+# ("YL10RB_2026-10-01", "lb 4444 2024_06_15"). The annotation file groups its
+# entries by day, and the key it uses is always the plain "YYYY-MM-DD" date --
+# never the folder name -- so a file written against one naming style still
+# matches a dataset that uses the other, and so the batch pipeline (which
+# reads the date out of the wav name) and the GUI agree.
+# ---------------------------------------------------------------------------
+
+# '-', '_' and spaces all separate. Bird names may end in a letter or a digit,
+# so the year is taken to start after a separator, after a letter, or at the
+# very start -- never by splitting a run of digits, which would let a numeric
+# name like "RT10" bleed into the year.
+DATE_FOLDER_RE = re.compile(
+    r'(?:^|[-_\s]|(?<=[^\W\d_]))(\d{4})[-_\s](\d{2})[-_\s](\d{2})\s*$')
+
+
+def folder_date(folder_name):
+    """Return the ``YYYY-MM-DD`` a day-folder name encodes, or None if it is
+    not a day folder.
+
+    The date must be a real calendar date, so folders that merely end in three
+    number groups are not mistaken for days.
+    """
+    m = DATE_FOLDER_RE.search(folder_name.strip())
+    if not m:
+        return None
+    try:
+        return datetime.date(*(int(g) for g in m.groups())).isoformat()
+    except ValueError:
+        return None
+
+
+def annotation_date_key(name):
+    """The key a day folder (or an existing annotation key) is stored under.
+
+    Anything that does not encode a date, such as ``"unknown_date"``, is kept
+    as it is.
+    """
+    return folder_date(name) or name
+
+
+def _preferred_entry(a, b):
+    """Of two entries for the same wav, the one worth keeping.
+
+    A human's review beats an unreviewed entry, and an annotated one beats an
+    empty one; otherwise the first one seen stays.
+    """
+    def rank(e):
+        return (is_human_verified(e), bool(e.get("segments")))
+    return b if rank(b) > rank(a) else a
+
+
+def normalize_annotation_dates(annotation):
+    """Re-key ``annotation`` in place so every day sits under its plain date.
+
+    Entries filed under "YL10RB_2026-10-01" and under "2026-10-01" are merged
+    into "2026-10-01". If both hold the same wav, the entry kept is chosen by
+    :func:`_preferred_entry`.
+
+    Returns the number of keys that were renamed or merged away, so a caller
+    knows whether the file needs writing back.
+    """
+    merged = {}
+    changed = 0
+    for key, entries in annotation.items():
+        new_key = annotation_date_key(key)
+        if new_key != key:
+            changed += 1
+        day = merged.setdefault(new_key, [])
+        for entry in entries:
+            name = entry.get("file_name")
+            idx = next((i for i, e in enumerate(day)
+                        if e.get("file_name") == name), None)
+            if idx is None:
+                day.append(entry)
+            else:
+                day[idx] = _preferred_entry(day[idx], entry)
+    annotation.clear()
+    annotation.update(merged)
+    return changed
+
+
+def song_wavs_by_date(bird_folder):
+    """Map each date key to ``{wav file name: path}`` for the song wavs under
+    the bird folder's day folders.
+
+    Day folders of the same date are pooled, whatever their naming style.
+    """
+    by_date = defaultdict(dict)
+    for d in sorted(os.listdir(bird_folder)):
+        day = os.path.join(bird_folder, d)
+        if not (os.path.isdir(day) and folder_date(d)):
+            continue
+        for path in song_wavs_under(day):
+            by_date[folder_date(d)].setdefault(os.path.basename(path), path)
+    return dict(by_date)
+
+
 def merge_json_files(json_file_1, json_file_2, output_file):
     """
     Merge two annotation JSON files into one.
@@ -84,6 +187,7 @@ def merge_json_files(json_file_1, json_file_2, output_file):
 
     merged_data = {}
     all_dates = list(data1.keys()) + [d for d in data2 if d not in data1]
+    data2 = _align_merged_annotations_to_master(data1, data2)
 
     for date in all_dates:
         # Day present in only one file -> copy as-is.
@@ -126,6 +230,81 @@ def merge_json_files(json_file_1, json_file_2, output_file):
 
     with open(output_file, 'w') as out_f:
         json.dump(merged_data, out_f, indent=4)
+    new_annotated_files = get_unique_wav_paths(json_file_1, json_file_2)
+    return new_annotated_files
+
+
+def _segment_overlap(seg_a, seg_b):
+    """Length of the time overlap between two [start, end, ...] segments (0 if disjoint)."""
+    return max(0.0, min(seg_a[1], seg_b[1]) - max(seg_a[0], seg_b[0]))
+
+
+def _align_merged_annotations_to_master(dataset_0, dataset_1):
+    """
+    some labels in some dataset are merged to another label in the master dataset.
+    this method, finds diffs in label types, and aligns the labels in the second dataset to the master dataset.
+
+    A label that appears in dataset_1 but nowhere in the master (dataset_0) is
+    taken to have been merged away by the master annotator. Every dataset_1
+    segment carrying that label is matched to the master segment it overlaps
+    most in time (same date and file_name):
+      - if there is such a segment, it takes the master's label for it, so a
+        label the master split between several classes follows the master;
+      - otherwise it takes the most frequent master label among all the
+        matches of that label.
+    Labels with no overlapping master segment anywhere are left unchanged.
+
+    Parameters:
+    dataset_0 (dict): master annotation (not modified).
+    dataset_1 (dict): second annotation (not modified).
+
+    Returns:
+    dict: a copy of dataset_1 with the merged-away labels rewritten.
+    """
+    master_labels = set(count_label_classes(dataset_0))
+    removed_labels = set(count_label_classes(dataset_1)) - master_labels
+    if not removed_labels:
+        return dataset_1
+
+    master_segments = {
+        (date, entry["file_name"]): entry.get("segments", [])
+        for date, entries in dataset_0.items()
+        for entry in entries
+    }
+
+    aligned = json.loads(json.dumps(dataset_1))  # deep copy
+    votes = defaultdict(lambda: defaultdict(int))
+    unmatched = []  # segments with a removed label and no overlapping master segment
+    for date, entries in aligned.items():
+        for entry in entries:
+            master_segs = master_segments.get((date, entry["file_name"])) or []
+            for seg in entry.get("segments", []):
+                if len(seg) < 3 or _normalize_label(seg[2]) not in removed_labels:
+                    continue
+                best = max(master_segs, key=lambda m: _segment_overlap(seg, m), default=None)
+                if best is not None and len(best) >= 3 and _segment_overlap(seg, best) > 0:
+                    votes[_normalize_label(seg[2])][_normalize_label(best[2])] += 1
+                    seg[2] = _normalize_label(best[2])
+                else:
+                    unmatched.append(seg)
+
+    mapping = {}
+    for label in sorted(removed_labels, key=str):
+        if votes[label]:
+            mapping[label] = max(votes[label], key=votes[label].get)
+            print(f"Label {label} not in master -> overlaps follow master "
+                  f"(votes: {dict(votes[label])}), elsewhere -> {mapping[label]}")
+        else:
+            print(f"Label {label} not in master and never overlaps it; left unchanged.")
+
+    for seg in unmatched:
+        label = _normalize_label(seg[2])
+        if label in mapping:
+            seg[2] = mapping[label]
+    return aligned
+
+
+
 
 def convert_mat_annotation_to_json_annotation(mat_file_path, json_file_path, bird_path):
     """
@@ -347,12 +526,13 @@ def remove_borring_wavs_from_auto_annotation(annotation_json, wav_dir, calls_lab
     #load the annotation json
     with open(annotation_json, 'r') as f:
         annotation_data = json.load(f)
+    wavs = song_wavs_by_date(wav_dir)
     for date, entries in annotation_data.items():
         for entry in entries:
             file_name = entry["file_name"]
-            wav_path = os.path.join(wav_dir, date, "chop_data", "wav", file_name)
-            if not os.path.exists(wav_path):
-                print(f"Warning: {wav_path} does not exist.")
+            wav_path = wavs.get(annotation_date_key(date), {}).get(file_name)
+            if wav_path is None:
+                print(f"Warning: no wav for {date}/{file_name}.")
                 continue
             # Check if the segments contain any of the calls_labels
             segments = entry.get("segments", [])
@@ -373,17 +553,17 @@ def remove_annotation_if_no_wav(annotation_json, wav_dir):
     with open(annotation_json, 'r') as f:
         annotation_data = json.load(f)
 
+    wavs = song_wavs_by_date(wav_dir)
     cleaned_data = {}
     removed_count = 0
     for date, entries in annotation_data.items():
         kept_entries = []
         for entry in entries:
             file_name = entry["file_name"]
-            wav_path = os.path.join(wav_dir, date, "chop_data", "wav", file_name)
-            if os.path.exists(wav_path):
+            if file_name in wavs.get(annotation_date_key(date), {}):
                 kept_entries.append(entry)
             else:
-                print(f"Removing {file_name} from annotation as {wav_path} does not exist.")
+                print(f"Removing {file_name} from annotation as no {date} folder holds it.")
                 removed_count += 1
         # Drop dates that no longer have any annotated file
         if kept_entries:
@@ -469,14 +649,40 @@ def song_wavs_under(root):
                      if f.lower().endswith('.wav') and not f.startswith('._'))
     return sorted(found)
 
+def get_unique_wav_paths(json_1, json_2):
+    """
+    Get unique wav paths from two annotation JSON files.
+
+    Parameters:
+    json_1 (str): Path to the first JSON file.
+    json_2 (str): Path to the second JSON file.
+
+    Returns:
+    set: Unique wav paths from both JSON files.
+    """
+    with open(json_1, 'r') as f1, open(json_2, 'r') as f2:
+        data1 = json.load(f1)
+        data2 = json.load(f2)
+
+    wav_paths = []
+    data = data1
+    for entries in data.values():
+        for entry in entries:
+            wav_paths.append(entry["file_name"])
+    new_files = set()
+    for entries in data2.values():
+        for entry in entries:
+            if entry["file_name"] not in wav_paths:
+                new_files.add(entry["file_name"])
+    return new_files
 
 if __name__=="__main__":
     # Example usage
-    # json_file_1 = '/Volumes/Extreme Pro/LBRK219RT/LBRK219_auto_merged_with_human_verified.json'
-    # json_file_0 = '/Volumes/Extreme Pro/LBRK219RT/LBRK219_auto_merged_with_human_verified_jacob.json'
-    # output = '/Volumes/Extreme Pro/LBRK219RT/LBRK219_auto_merged_with_human_verified.json'
+    json_file_0 = '/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged_1910.json'
+    json_file_1 = '/Users/nitzankarby/Downloads/LY10RB_annotation_talgr_annotation_merged_2310.json'
+    output = '/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged_2310.json'
     # # merge_json_files(json_file_0, json_file_1, output)
-    # # add_human_verified_flag_to_json("/Volumes/Extreme Pro/LBRK219RT/LBRK219RT_annotation_merged_22_07_26.json", default=True)
-    # remove_borring_wavs_from_auto_annotation('/Volumes/Extreme Pro/LBRK219RT/LBRK219_auto_merged_with_human_verified.json', "/Volumes/Extreme Pro/LBRK219RT", calls_labels=["17","23","25", "24"], minimal_labels_to_acount_as_song=2)
-    # remove_annotation_if_no_wav('/Volumes/Extreme Pro/LBRK219RT/LBRK219_auto_merged_with_human_verified.json', "/Volumes/Extreme Pro/LBRK219RT")
-    merge_json_files('/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged.json', "/Users/nitzankarby/Downloads/LY10RB_annotation_talgr_annotation_pessia_0924.json", '/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged.json')
+
+    # print(len(get_unique_wav_paths('/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged.json', "/Users/nitzankarby/Downloads/LY10RB_annotation_talgr_annotation_merged.json")))
+    new_annotations = merge_json_files(json_file_0, json_file_1, output)
+    print(f" {len(new_annotations)} Newly annotated files: {new_annotations}")

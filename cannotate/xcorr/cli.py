@@ -24,7 +24,9 @@ def wav_paths_for_root(audio_root):
     A date is a folder directly inside the root; its songs are what
     :func:`utils.song_wavs_under` finds beneath it.  That is the same rule the
     annotation GUI applies, so fitting and the GUI always agree on which files
-    exist, whatever the nesting.
+    exist, whatever the nesting.  The date is the annotation file's key for
+    the folder (:func:`utils.annotation_date_key`), so "YL10RB_2026-10-01"
+    and "2026-10-01" both come out as "2026-10-01".
     """
     import utils
 
@@ -35,8 +37,9 @@ def wav_paths_for_root(audio_root):
     except OSError as exc:
         raise ValueError(f"Cannot read the audio root {audio_root}: {exc}")
     for date in dates:
+        key = utils.annotation_date_key(date)
         for path in utils.song_wavs_under(os.path.join(audio_root, date)):
-            paths[(date, os.path.basename(path))] = path
+            paths.setdefault((key, os.path.basename(path)), path)
     return paths
 
 
@@ -68,13 +71,18 @@ def _parse_labels(text):
 
 
 def _load_annotations(path):
+    import utils
+
     try:
         with open(path) as fh:
-            return json.load(fh)
+            db_data = json.load(fh)
     except OSError as exc:
         raise ValueError(f"Cannot read the annotation file: {exc}")
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path} is not valid JSON: {exc}")
+    # Days filed under a folder name match the plain dates of the audio root.
+    utils.normalize_annotation_dates(db_data)
+    return db_data
 
 
 def _fit(args):

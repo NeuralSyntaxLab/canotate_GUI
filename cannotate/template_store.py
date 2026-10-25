@@ -28,7 +28,7 @@ from .xcorr import bank as xbank
 # template.  Segments, not phrases: a segment is one rendition of the syllable,
 # which is both what the user selects when asking for a suggestion and the
 # granularity a 200 ms template is cut at.
-MIN_SEGMENTS = 15
+MIN_SEGMENTS = 10
 
 # Never templated.  999 is the unlabeled placeholder; 0 is the reject marker
 # the error-correction "e" shortcut writes.  Both are heterogeneous by

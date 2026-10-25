@@ -37,7 +37,7 @@ from classification_model.segment_classifier import (
 # honours the CANNOTATE_MODELS_DIR override.
 from cannotate.cannotate_utils import ONNX_DEFAULT_WEIGHTS  # noqa: E402,F401
 from cannotate.onnx_segmentation import OnnxSegmentationModel  # noqa: E402,F401
-from utils import song_wavs_under
+from utils import normalize_annotation_dates, song_wavs_under
 
 
 def _best_device():
@@ -266,6 +266,9 @@ class FullAnnotationPipeline:
             if annotation_json.exists()
             else {}
         )
+        # Days written under a folder name ("YL10RB_2026-10-01") join the
+        # plain date this run files them under, instead of being duplicated.
+        normalize_annotation_dates(data)
 
         wav_files = [Path(p) for p in song_wavs_under(str(wav_dir))]
         total = len(wav_files)

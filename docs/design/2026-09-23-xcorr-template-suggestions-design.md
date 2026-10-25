@@ -50,7 +50,7 @@ loads with empty provenance rather than failing.
   `MIN_SEGMENTS` verified segments falls back to its unverified ones, so a
   corpus with no verification yet still gets templates.
 
-A label is eligible once it has **`MIN_SEGMENTS = 15` segments** in that pool.
+A label is eligible once it has **`MIN_SEGMENTS = 10` segments** in that pool.
 
 `ensure(bird_folder, db_data, date_to_wavs, progress)` loads the newest bank,
 finds the eligible labels it lacks, fits **only those**, merges, and writes a
@@ -140,7 +140,7 @@ Headless, no tkinter, in the style of the existing `tests/`:
 * provenance round-trips through `save`/`load`, and a bank saved without it
   still loads;
 * a fitted template's provenance re-cuts the same patch from its source;
-* eligibility: the 15-segment threshold, `0`/`999`/`None` exclusion,
+* eligibility: the 10-segment threshold, `0`/`999`/`None` exclusion,
   AI-flagged exclusion, verified-preferred with fallback;
 * `ensure()` writes a new dated file only when a label was added, the union is
   preserved, and the old file is untouched;

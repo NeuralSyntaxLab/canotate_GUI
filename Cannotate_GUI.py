@@ -39,6 +39,7 @@ from utils import (
     count_label_classes,
     merge_label_classes,
     ensure_human_verified_field,
+    normalize_annotation_dates,
     is_human_verified,
     HUMAN_VERIFIED_KEY,
 )
@@ -168,30 +169,8 @@ def run_template_fit(parent, bird_folder, db_data, date_to_wavs, on_done,
     parent.after(150, poll)
 
 
-# Day folders are "<year>_<month>_<day>", optionally behind a bird-name prefix
-# ("lb4444_2024_06_15", "RO 2024-06-15", "RT10LO_2024_06_15"); '-', '_' and
-# spaces all separate. Bird names may end in a letter or a digit, so the year
-# is taken to start after a separator, after a letter, or at the very start —
-# never by splitting a run of digits, which would let a numeric name like
-# "RT10" bleed into the year.
-DATE_FOLDER_RE = re.compile(
-    r'(?:^|[-_\s]|(?<=[^\W\d_]))(\d{4})[-_\s](\d{2})[-_\s](\d{2})\s*$')
-
-
-def folder_date(folder_name):
-    """Return the ``YYYY-MM-DD`` a day-folder name encodes, or None if it is
-    not a day folder.
-
-    The date must be a real calendar date, so folders that merely end in three
-    number groups are not mistaken for days.
-    """
-    m = DATE_FOLDER_RE.search(folder_name.strip())
-    if not m:
-        return None
-    try:
-        return datetime.date(*(int(g) for g in m.groups())).isoformat()
-    except ValueError:
-        return None
+# Day folders and their date keys: see utils.folder_date.
+folder_date = utils.folder_date
 
 
 def collect_wavs(day_folder):
@@ -262,12 +241,19 @@ def Cannotate():
                 return
             with open(annotation_file, "r") as f:
                 db_data = json.load(f)
-            # One-time migration: give every file entry a human_verified flag.
+            # One-time migrations: give every file entry a human_verified
+            # flag, and file every day under its plain date, whatever the
+            # day folders were called when it was written.
             n_added = ensure_human_verified_field(db_data)
-            if n_added:
+            n_rekeyed = normalize_annotation_dates(db_data)
+            if n_added or n_rekeyed:
                 with open(annotation_file, "w") as f:
                     json.dump(db_data, f, indent=2)
+            if n_added:
                 print(f"Added '{HUMAN_VERIFIED_KEY}' to {n_added} file entry/entries "
+                      f"in {os.path.basename(annotation_file)}")
+            if n_rekeyed:
+                print(f"Re-keyed {n_rekeyed} day(s) to plain dates "
                       f"in {os.path.basename(annotation_file)}")
         else:
             user_name = simpledialog.askstring(
@@ -286,9 +272,10 @@ def Cannotate():
 
     # --- find date subfolders ---
     # A day folder is named either "<year>_<month>_<day>" or the same date
-    # behind a bird-name prefix ("lb4444_2024_06_15", "lb 4444 2024-06-15").
-    # Separators may be '-', '_' or spaces. The folder name itself stays the
-    # key used in the annotation file, so existing annotations keep matching.
+    # behind a bird-name prefix ("YL10RB_2026-10-01", "lb 4444 2024_06_15").
+    # Separators may be '-', '_' or spaces. Days are keyed by the plain
+    # "YYYY-MM-DD" date, in this window and in the annotation file, so either
+    # naming style matches annotations written against the other.
     date_folders = [
         d for d in os.listdir(bird_folder)
         if os.path.isdir(os.path.join(bird_folder, d)) and folder_date(d)
@@ -301,11 +288,14 @@ def Cannotate():
     date_folders.sort(key=lambda d: (folder_date(d), d))
 
     # --- map date -> wavs ---
+    # Folders of the same date (one prefixed, one not) are pooled into a day.
     date_to_wavs = {}
     for d in date_folders:
         wfs = collect_wavs(os.path.join(bird_folder, d))
         if wfs:
-            date_to_wavs[d] = wfs
+            date_to_wavs.setdefault(folder_date(d), []).extend(wfs)
+    for wfs in date_to_wavs.values():
+        wfs.sort(key=os.path.basename)
 
     # --- build global flattened song list ---
     global_songs = []
@@ -323,8 +313,14 @@ def Cannotate():
     bank_holder = {"bank": None}
     open_viewers = []
 
-    def _adopt_bank(result):
-        """Publish a freshly fitted bank to every window that wants one."""
+    def _adopt_bank(result, recalculated=False):
+        """Publish a freshly fitted bank to every window that wants one.
+
+        *recalculated* marks the annotator's own Recalc Templates press: the
+        on-disk previews are then rewritten even if the bank did not change,
+        because they may still be annotation-time snapshots that never
+        matched what suggestions are scored against.
+        """
         bank = result.bank if result is not None else None
         bank_holder["bank"] = bank
         for viewer in list(open_viewers):
@@ -338,16 +334,18 @@ def Cannotate():
         if result is None:
             return
         print(f"[templates] {result.summary()}")
-        # Only when the bank actually changed: regenerating these re-reads a
-        # wav and draws a figure per label, which is not worth doing on the
-        # ordinary launch where nothing was fitted.
-        if result.written:
+        # Only when the bank changed or the annotator asked: regenerating
+        # these re-reads a wav and draws a figure per label, which is not
+        # worth doing on the ordinary launch where nothing was fitted.
+        if result.written or recalculated:
             regenerate_disk_templates(
                 template_store.as_display_templates(bank, date_to_wavs),
-                os.path.join(bird_folder, "syllable_templates"))
+                os.path.join(bird_folder, "syllable_templates"),
+                keep=result.pending)
 
     def refit_templates(force=False):
-        run_template_fit(root, bird_folder, db_data, date_to_wavs, _adopt_bank,
+        run_template_fit(root, bird_folder, db_data, date_to_wavs,
+                         lambda result: _adopt_bank(result, recalculated=force),
                          force=force)
 
     def global_index_of(date_str, base_name):
