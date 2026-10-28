@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
@@ -341,6 +342,8 @@ class IntegratedSpectrogramViewer:
         self.segment_region_mode = False
         self.move_boundaries_mode = False
         self.annotate_region_mode = False
+        self.move_borders_to_thresholds_mode = False
+        self.segment_overlap_mode = False
         self.region_start = None
         self.drag_boundary_info = None
         self.current_annotation = None
@@ -369,6 +372,10 @@ class IntegratedSpectrogramViewer:
                   command=self.activate_move_boundaries).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Annotate Region",
                   command=self.activate_annotate_region_mode).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Move Borders to Thresholds",
+                  command=self.activate_move_borders_to_thresholds_mode).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Segment Overlapping Syllables",
+                  command=self.activate_segment_overlap_mode).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Directions",
                   command=self.show_directions).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="View Syllable Template",
@@ -439,6 +446,9 @@ class IntegratedSpectrogramViewer:
         self._bind_shortcut("j", lambda e: self.activate_join_mode())
         self._bind_shortcut("c", self.activate_entropy_replace_mode)
         self._bind_shortcut("w", self.replace_with_all_entropy_suggestions)
+        self._b_last_press_time = 0
+        self._bind_shortcut("b", self._on_b_key)
+        self._bind_shortcut("e", lambda e: self.activate_segment_overlap_mode())
         self._bind_shortcut("t", lambda e: self.activate_suggest_mode())
         self._bind_shortcut("g", lambda e: self.activate_auto_suggest_mode())
         self._bind_shortcut("p", lambda e: self.prune_mismatched_labels())
@@ -1359,6 +1369,194 @@ class IntegratedSpectrogramViewer:
             self.annotation_callback(self.segments)
 
     # ================================================================
+    # Segment overlapping syllables
+    # ================================================================
+
+    def activate_segment_overlap_mode(self):
+        """Drag a region; each syllable in it is cut 2 ms before the next."""
+        self.deactivate_all_modes()
+        self.segment_overlap_mode = True
+        self.overlap_start = None
+        self.overlap_cid_press = self.canvas.mpl_connect(
+            "button_press_event", self.on_overlap_click)
+        self.overlap_cid_motion = self.canvas.mpl_connect(
+            "motion_notify_event", self.on_overlap_motion)
+        self.overlap_cid_release = self.canvas.mpl_connect(
+            "button_release_event", self.on_overlap_release)
+
+    def on_overlap_click(self, event):
+        if not self.segment_overlap_mode or event.inaxes != self.ax_spec:
+            return
+        self.overlap_start = event.xdata
+        self.temp_rect = Rectangle(
+            (self.overlap_start, self.F[0]), 0, self.F[-1] - self.F[0],
+            linewidth=1, edgecolor='lime', linestyle='--', facecolor='none')
+        self.ax_spec.add_patch(self.temp_rect)
+        self.canvas.draw()
+
+    def on_overlap_motion(self, event):
+        if (not self.segment_overlap_mode or self.temp_rect is None
+                or event.inaxes != self.ax_spec):
+            return
+        x_current = event.xdata
+        if x_current is None:
+            return
+        new_x = min(self.overlap_start, x_current)
+        new_width = abs(x_current - self.overlap_start)
+        self.temp_rect.set_x(new_x)
+        self.temp_rect.set_width(new_width)
+        self.canvas.draw()
+
+    def on_overlap_release(self, event):
+        if (not self.segment_overlap_mode or self.temp_rect is None
+                or event.inaxes != self.ax_spec):
+            return
+        x_end = event.xdata
+        if x_end is None:
+            return
+        region_start, region_end = sorted([self.overlap_start, x_end])
+        self.temp_rect.remove()
+        self.temp_rect = None
+        self.canvas.draw()
+
+        def in_region(seg):
+            return region_start <= (seg[0] + seg[1]) / 2.0 <= region_end
+
+        region_segments = sorted((s for s in self.segments if in_region(s)),
+                                 key=lambda s: s[0])
+        if len(region_segments) < 2:
+            messagebox.showinfo(
+                "Segment Overlapping Syllables",
+                "Need at least 2 syllables in the selected region to "
+                "segment overlaps.")
+            return
+
+        # Every syllable but the last ends 2 ms before the next one starts.
+        # One that would end before it begins is dropped.  seg[3:] carries
+        # the AI flag through unchanged.
+        new_segments = []
+        for seg, nxt in zip(region_segments, region_segments[1:]):
+            new_end = nxt[0] - 0.002
+            if new_end > seg[0]:
+                new_segments.append((seg[0], new_end) + tuple(seg[2:]))
+        new_segments.append(region_segments[-1])
+
+        self.segments = ([s for s in self.segments if not in_region(s)]
+                         + new_segments)
+        self.segments.sort(key=lambda s: s[0])
+        self.update_plots()
+        if self.annotation_callback:
+            self.annotation_callback(self.segments)
+
+    # ================================================================
+    # Move borders to entropy thresholds
+    # ================================================================
+
+    def activate_move_borders_to_thresholds_mode(self):
+        """Drag a region; borders in it snap to the nearest threshold crossing."""
+        self.deactivate_all_modes()
+        self.move_borders_to_thresholds_mode = True
+        self.region_start = None
+        self.move_borders_cid_press = self.canvas.mpl_connect(
+            "button_press_event", self.on_move_borders_press)
+        self.move_borders_cid_motion = self.canvas.mpl_connect(
+            "motion_notify_event", self.on_move_borders_motion)
+        self.move_borders_cid_release = self.canvas.mpl_connect(
+            "button_release_event", self.on_move_borders_release)
+
+    def on_move_borders_press(self, event):
+        if (not self.move_borders_to_thresholds_mode
+                or event.inaxes != self.ax_spec):
+            return
+        self.region_start = event.xdata
+        self.temp_rect = Rectangle(
+            (self.region_start, self.F[0]), 0, self.F[-1] - self.F[0],
+            linewidth=1, edgecolor='magenta', linestyle='--', facecolor='none')
+        self.ax_spec.add_patch(self.temp_rect)
+        self.canvas.draw()
+
+    def on_move_borders_motion(self, event):
+        if (not self.move_borders_to_thresholds_mode or self.temp_rect is None
+                or event.inaxes != self.ax_spec):
+            return
+        x_current = event.xdata
+        if x_current is None:
+            return
+        new_x = min(self.region_start, x_current)
+        new_width = abs(x_current - self.region_start)
+        self.temp_rect.set_x(new_x)
+        self.temp_rect.set_width(new_width)
+        self.canvas.draw()
+
+    def on_move_borders_release(self, event):
+        if (not self.move_borders_to_thresholds_mode or self.temp_rect is None
+                or event.inaxes != self.ax_spec):
+            return
+        x_end = event.xdata
+        if x_end is None:
+            return
+        region_start, region_end = sorted([self.region_start, x_end])
+        self.temp_rect.remove()
+        self.temp_rect = None
+        self.region_start = None
+        self.canvas.draw()
+        self._apply_borders_to_thresholds(region_start, region_end)
+
+    def _apply_borders_to_thresholds(self, region_start, region_end):
+        """Snap segment borders in the region to the nearest suggestion edge.
+
+        Only runs while suggestions are shown, since they are what the borders
+        snap to.  A border is left where it is if moving it would overlap a
+        neighbour or shrink its syllable below 10 ms.
+        """
+        if not self.show_suggestions:
+            return
+        suggestions = self.compute_suggestions()
+        candidate_starts = [t0 for t0, _t1 in suggestions
+                            if region_start <= t0 <= region_end]
+        candidate_ends = [t1 for _t0, t1 in suggestions
+                          if region_start <= t1 <= region_end]
+        if not candidate_starts and not candidate_ends:
+            return
+        min_gap = 0.01
+        self.segments.sort(key=lambda s: s[0])
+        new_segments = [list(seg) for seg in self.segments]
+
+        # Pass 1: starts, never crossing the previous syllable's end.
+        for i, seg in enumerate(new_segments):
+            if region_start <= seg[0] <= region_end and candidate_starts:
+                new_start = min(candidate_starts, key=lambda s: abs(s - seg[0]))
+                prev_end = new_segments[i - 1][1] if i > 0 else float('-inf')
+                if new_start >= prev_end and new_start + min_gap < seg[1]:
+                    seg[0] = new_start
+
+        # Pass 2: ends, never crossing the next syllable's start.
+        for i, seg in enumerate(new_segments):
+            if region_start <= seg[1] <= region_end and candidate_ends:
+                new_end = min(candidate_ends, key=lambda s: abs(s - seg[1]))
+                next_start = (new_segments[i + 1][0]
+                              if i < len(new_segments) - 1 else float('inf'))
+                if new_end <= next_start and new_end > seg[0] + min_gap:
+                    seg[1] = new_end
+
+        self.segments = [tuple(seg) for seg in new_segments]
+        self.update_plots()
+        if self.annotation_callback:
+            self.annotation_callback(self.segments)
+
+    def _on_b_key(self, event):
+        """b: drag-to-snap mode.  b twice quickly: snap the whole view."""
+        now = time.time()
+        if now - self._b_last_press_time < 0.35:
+            self._b_last_press_time = 0
+            self._apply_borders_to_thresholds(
+                self.current_window_start,
+                self.current_window_start + self.window_duration)
+        else:
+            self._b_last_press_time = now
+            self.activate_move_borders_to_thresholds_mode()
+
+    # ================================================================
     # Spectrogram settings
     # ================================================================
 
@@ -1635,6 +1833,8 @@ class IntegratedSpectrogramViewer:
         self.segment_start = None
         self.region_start = None
         self.join_mode = False
+        self.move_borders_to_thresholds_mode = False
+        self.segment_overlap_mode = False
 
         if self.temp_rect is not None:
             try:
@@ -1648,6 +1848,9 @@ class IntegratedSpectrogramViewer:
             ("del_cid_press", "del_cid_motion", "del_cid_release"),
             ("boundary_cid_press", "boundary_cid_motion", "boundary_cid_release"),
             ("join_cid_press", "join_cid_motion", "join_cid_release"),
+            ("move_borders_cid_press", "move_borders_cid_motion",
+             "move_borders_cid_release"),
+            ("overlap_cid_press", "overlap_cid_motion", "overlap_cid_release"),
             ("entropy_cid_press", "entropy_cid_motion", "entropy_cid_release"),
             ("suggest_cid_press", "suggest_cid_motion", "suggest_cid_release"),
             ("auto_suggest_cid_press", "auto_suggest_cid_motion",
@@ -2137,7 +2340,10 @@ class IntegratedSpectrogramViewer:
             "s: Segment Individual\n"
             "d: Delete Region\n"
             "Backspace: Delete Last Segment\n"
-            "m: Move Segments"
+            "m: Move Segments\n"
+            "b: Move Borders to Thresholds (drag a region)\n"
+            "b b: Move Borders to Thresholds in the whole view\n"
+            "e: Segment Overlapping Syllables (drag a region)\n"
             "o: Zoom Out\n"
             "i: Zoom In\n"
             "v: Toggle Human Verified\n"
