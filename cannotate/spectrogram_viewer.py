@@ -319,6 +319,7 @@ class IntegratedSpectrogramViewer:
         self.ax_noise.set_ylabel("Noise", fontsize=7)
         self.ax_noise.set_yticks([])
         self.noise_audio = None
+        self.audio_full_scale = 1.0
         self.entropy_thresh = 0.5
         self.min_syl_length = 10
 
@@ -1392,7 +1393,7 @@ class IntegratedSpectrogramViewer:
         if not hasattr(self, "audio"):
             return
         prev_window_start = self.current_window_start
-        y = self.audio
+        y = self.audio / self.audio_full_scale
         fs = self.fs
 
         if self.spec_window_type == "dpss":
@@ -2406,10 +2407,14 @@ class IntegratedSpectrogramViewer:
     # ================================================================
 
     def load_existing_data(self, y, fs, file, existing_segments=None,
-                           noise_audio=None):
+                           noise_audio=None, full_scale=1.0):
         b, a = butter(N=4, Wn=1000 / (fs / 2), btype='highpass')
         y_hp = filtfilt(b, a, y)  # noqa: F841  # computed but original used
         self.audio = y
+        # Only the display spectrogram sees audio on [-1, 1]; self.audio keeps
+        # its native scale because segmentation and xcorr scoring were built
+        # on it.
+        self.audio_full_scale = full_scale
         self.fs = fs
         self.wav_filename = file
         # Belongs to the song that just closed, not to this one.
@@ -2440,10 +2445,12 @@ class IntegratedSpectrogramViewer:
             window1 = 'hann'
             window2 = 'hann'
 
-        F, T, S1 = spectrogram(y, fs, window=window1, noverlap=noverlap,
+        y_disp = y / full_scale
+        F, T, S1 = spectrogram(y_disp, fs, window=window1, noverlap=noverlap,
                                 nfft=self.nfft, nperseg=self.nfft)
-        _, T, S2 = spectrogram(y, fs, window=window2, noverlap=noverlap,
+        _, T, S2 = spectrogram(y_disp, fs, window=window2, noverlap=noverlap,
                                 nfft=self.nfft, nperseg=self.nfft)
+        del y_disp
 
         S_power = (np.abs(S1) + np.abs(S2)) / 2
         S_raw = np.log10(1 + (S_power + 1e-12))

@@ -571,7 +571,8 @@ def Cannotate():
             return
 
         try:
-            fs, y, noise_audio = read_wav_channels(full_path)
+            fs, y, noise_audio, audio_full_scale = read_wav_channels(
+                full_path, with_full_scale=True)
         except Exception as e:
             messagebox.showerror("Error", f"Error reading WAV file:\n{e}")
             return
@@ -633,7 +634,8 @@ def Cannotate():
         open_viewers.append(viewer)
         viewer.load_existing_data(y, fs, file_base,
                                   existing_segments=existing_segments,
-                                  noise_audio=noise_audio)
+                                  noise_audio=noise_audio,
+                                  full_scale=audio_full_scale)
         # Opening a file means a human is looking at it, so the window starts
         # marked verified. Nothing is written yet: set_human_verified does not
         # fire the callback, so the flag only reaches the JSON when the viewer

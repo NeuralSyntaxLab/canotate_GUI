@@ -95,18 +95,39 @@ def read_wav(path):
     return fs, data
 
 
-def read_wav_channels(path):
+def full_scale(dtype):
+    """The value that maps samples of *dtype* onto [-1, 1].
+
+    scipy returns integer PCM at its native scale (int16 -> +-32768), while
+    soundfile returns floats in [-1, 1].  The display spectrogram's
+    ``log10(1 + power)`` is not scale-invariant, so the viewer divides by this
+    to draw the same image birdsong-preprocessing-gui (soundfile) draws.
+    """
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        return float(np.iinfo(dtype).max) + 1.0
+    return 1.0
+
+
+def read_wav_channels(path, with_full_scale=False):
     """Read a stereo WAV and return ``(fs, song_channel, noise_channel)``.
 
     Channel assignment is based on spectral flatness: the flattest channel is
     treated as white noise / trigger; the most tonal channel is the song mic.
     For mono files ``noise_channel`` is ``None``.
+
+    With *with_full_scale*, a fourth value is returned: :func:`full_scale` of
+    the file's sample type, which the stereo path's float cast would lose.
     """
     fs, data = _load_raw(path)
+    scale = full_scale(data.dtype)
     if data.ndim == 1:
-        return fs, data, None
-    song_idx, noise_idx = _identify_channels(data)
-    return fs, data[:, song_idx].astype(np.float64), data[:, noise_idx].astype(np.float64)
+        out = (fs, data, None)
+    else:
+        song_idx, noise_idx = _identify_channels(data)
+        out = (fs, data[:, song_idx].astype(np.float64),
+               data[:, noise_idx].astype(np.float64))
+    return out + (scale,) if with_full_scale else out
 
 
 # ── Pretty sonogram ─────────────────────────────────────────────────
