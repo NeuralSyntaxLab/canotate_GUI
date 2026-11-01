@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
@@ -93,6 +94,88 @@ def _save_default_clf_model_dir(path):
     data["classification_model_dir"] = path
     with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def _load_setting(key, default):
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and key in data:
+            return data[key]
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def _save_setting(key, value):
+    """Store one value in the settings file, keeping everything else in it."""
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data[key] = value
+    try:
+        with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as e:
+        print(f"Could not save setting {key!r}: {e}")
+
+
+# ── Playback level ───────────────────────────────────────────────────
+# Some recordings peak far below full scale, and on a laptop speaker they are
+# close to inaudible. Every sound the viewer plays goes through
+# playback_signal, which converts to float in [-1, 1], optionally auto-levels
+# to a fixed peak, and applies the user's volume.
+MAX_VOLUME_PERCENT = 1000
+AUTO_LEVEL_PEAK = 0.9
+
+
+def _clamp_volume(percent):
+    try:
+        return min(max(float(percent), 0.0), float(MAX_VOLUME_PERCENT))
+    except (TypeError, ValueError):
+        return 100.0
+
+
+def _full_scale(data):
+    """The value that corresponds to 1.0 for *data*'s sample format."""
+    if np.issubdtype(data.dtype, np.integer):
+        return float(np.iinfo(data.dtype).max) + 1.0
+    # Stereo files reach us as float64 that still carries integer sample
+    # values (read_wav_channels casts without rescaling); a peak above 1 means
+    # it is one of those, so pick the integer range it fits.
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak <= 1.0:
+        return 1.0
+    for bits in (16, 24, 32):
+        if peak <= 2.0 ** (bits - 1):
+            return 2.0 ** (bits - 1)
+    return peak
+
+
+def playback_signal(data, volume=1.0, auto_level=False, ref_peak=None):
+    """Return *data* as float32 ready for ``sd.play``.
+
+    volume      linear gain applied last (1.0 = unchanged).
+    auto_level  scale so the loudest sample reaches AUTO_LEVEL_PEAK first.
+    ref_peak    peak to level against, in the units of *data*. Passing the
+                whole file's peak keeps a quiet stretch quiet instead of
+                blowing its background noise up to full loudness.
+
+    The result is clipped to [-1, 1]: loud settings distort rather than wrap.
+    """
+    data = np.asarray(data)
+    scale = 1.0 / _full_scale(data)
+    if auto_level:
+        peak = (float(ref_peak) if ref_peak is not None
+                else float(np.max(np.abs(data))) if data.size else 0.0)
+        if peak > 0:
+            scale = AUTO_LEVEL_PEAK / peak
+    out = data.astype(np.float32) * np.float32(scale * volume)
+    return np.clip(out, -1.0, 1.0, out=out)
 
 
 def _prefix(extra_msg, msg):
@@ -301,9 +384,32 @@ class IntegratedSpectrogramViewer:
                                   font=("Arial", 10, "bold"),
                                   state=tk.NORMAL if save_callback else tk.DISABLED)
         self.btn_save.pack(side=tk.LEFT, padx=(0, 6), pady=3)
+        self._audio_peak = None
+        self._volume_save_id = None
         self.lbl_save_status = tk.Label(top_bar, text="", font=("Arial", 9),
                                         fg="#2e7d32")
         self.lbl_save_status.pack(side=tk.LEFT)
+
+        # Volume lives in the top bar so it is reachable whatever is playing:
+        # the window, slow motion, a selection or a template.
+        self.volume_var = tk.DoubleVar(
+            value=_clamp_volume(_load_setting("playback_volume_percent", 100)))
+        self.auto_level_var = tk.BooleanVar(
+            value=bool(_load_setting("playback_auto_level", True)))
+        tk.Checkbutton(top_bar, text="Auto-level", variable=self.auto_level_var,
+                       command=self._on_auto_level_toggled
+                       ).pack(side=tk.RIGHT, padx=(0, 10))
+        self.lbl_volume = tk.Label(top_bar, width=6, anchor='w')
+        self.lbl_volume.pack(side=tk.RIGHT)
+        volume_scale = ttk.Scale(top_bar, from_=0, to=MAX_VOLUME_PERCENT,
+                                 length=180, orient=tk.HORIZONTAL,
+                                 variable=self.volume_var,
+                                 command=self._on_volume_changed)
+        volume_scale.pack(side=tk.RIGHT, padx=4)
+        volume_scale.bind("<ButtonRelease-1>",
+                          self._apply_volume_to_current_play)
+        tk.Label(top_bar, text="\U0001F50A Volume").pack(side=tk.RIGHT)
+        self._update_volume_label()
 
         # ── Matplotlib figure ────────────────────────────────
         self.frame = tk.Frame(self.root)
@@ -351,7 +457,40 @@ class IntegratedSpectrogramViewer:
         self.canvas.mpl_connect("button_press_event", self.on_click)
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
         self.canvas.mpl_connect("button_release_event", self.on_release)
+        self.canvas.mpl_connect("draw_event", self._on_canvas_draw)
         self.dragging_thresh = False
+
+        # ── Transport: play / pause / stop and a seek bar ────
+        # Playback covers the visible window. While it runs a vertical
+        # playhead crosses the plots; pausing leaves it where the sound
+        # stopped, and Play resumes from there. The seek bar spans the
+        # window, so dragging it picks where the next Play starts.
+        self._play_pos = None        # playhead time (s), None when stopped
+        self._playing = False
+        self._play_speed = 1.0
+        self._play_anchor = None     # (monotonic clock, song time) at start
+        self._play_end = None
+        self._play_after_id = None
+        self._playhead_lines = []
+        self._blit_background = None
+        self._seek_syncing = False
+
+        transport = tk.Frame(self.root)
+        transport.pack(fill='x')
+        self.btn_play_pause = tk.Button(transport, text="▶ Play", width=9,
+                                        command=self.toggle_play_pause)
+        self.btn_play_pause.pack(side=tk.LEFT, padx=5)
+        tk.Button(transport, text="■ Stop",
+                  command=self.stop_playback).pack(side=tk.LEFT, padx=(0, 5))
+        self.lbl_play_time = tk.Label(transport, width=24, anchor='w',
+                                      font=("Courier", 10))
+        self.lbl_play_time.pack(side=tk.LEFT, padx=5)
+        self.seek_var = tk.DoubleVar(value=0.0)
+        self.seek_scale = ttk.Scale(transport, from_=0.0, to=1.0,
+                                    orient=tk.HORIZONTAL,
+                                    variable=self.seek_var,
+                                    command=self._on_seek)
+        self.seek_scale.pack(side=tk.LEFT, fill='x', expand=True, padx=5)
 
         # ── Button row 1 ─────────────────────────────────────
         btn_frame = tk.Frame(self.root)
@@ -450,6 +589,8 @@ class IntegratedSpectrogramViewer:
         self._bind_shortcut("x", self.accept_suggestions_and_classify)
         self._bind_shortcut("<Up>", lambda e: self.increase_threshold())
         self._bind_shortcut("<Down>", lambda e: self.decrease_threshold())
+
+        self._bind_shortcut("<space>", self.toggle_play_pause)
 
         self.join_mode = False
         self.suggest_mode = False
@@ -1214,16 +1355,204 @@ class IntegratedSpectrogramViewer:
     # ================================================================
 
     def play_slowmo_window(self):
-        if not hasattr(self, 'audio'):
+        self.start_playback(speed=self.slowmo_speed)
+
+    def play_current_window(self):
+        self.start_playback(speed=1.0)
+
+    def _window_bounds(self):
+        start = self.current_window_start
+        end = start + self.window_duration
+        if getattr(self, "audio", None) is not None and self.fs:
+            end = min(end, len(self.audio) / self.fs)
+        return start, end
+
+    def start_playback(self, speed=None):
+        """Play the visible window, resuming from a paused playhead."""
+        if getattr(self, "audio", None) is None or not getattr(self, "fs", None):
             return
-        start_sample = int(self.current_window_start * self.fs)
-        end_sample = int((self.current_window_start + self.window_duration) * self.fs)
-        segment = self.audio[start_sample:end_sample]
-        sd.stop()
+        if speed is None:
+            speed = self._play_speed
+        w_start, w_end = self._window_bounds()
+        t0 = self._play_pos
+        if t0 is None or not (w_start <= t0 < w_end - 1e-3):
+            t0 = w_start
+        i0 = max(0, int(round(t0 * self.fs)))
+        i1 = min(len(self.audio), int(round(w_end * self.fs)))
+        if i1 <= i0:
+            return
         try:
-            sd.play(segment, int(self.fs * self.slowmo_speed))
+            self._safe_play(self.audio[i0:i1], int(self.fs * speed),
+                            ref_peak=self._audio_peak)
         except Exception as e:
             messagebox.showerror("Error", f"Playback failed: {e}")
+            return
+        self._play_speed = speed
+        self._play_pos = t0
+        self._play_end = w_end
+        self._play_anchor = (time.monotonic(), t0)
+        self._playing = True
+        self._refresh_transport()
+        self._play_tick()
+
+    def pause_playback(self):
+        if not self._playing:
+            return
+        self._advance_playhead()
+        sd.stop()
+        self._halt_play_tracking()
+        self._refresh_transport()
+
+    def stop_playback(self):
+        sd.stop()
+        self._halt_play_tracking()
+        self._play_pos = None
+        self._refresh_transport()
+
+    def toggle_play_pause(self, event=None):
+        # With a button focused, Space has already pressed it.
+        if event is not None and getattr(event, "widget", None) is not None:
+            try:
+                if event.widget.winfo_class() in ("Button", "TButton",
+                                                  "Checkbutton"):
+                    return None
+            except (AttributeError, tk.TclError):
+                pass
+        if self._playing:
+            self.pause_playback()
+        else:
+            self.start_playback()
+        return "break"
+
+    def _halt_play_tracking(self):
+        """Stop moving the playhead without touching the audio or position."""
+        self._playing = False
+        if self._play_after_id is not None:
+            try:
+                self.root.after_cancel(self._play_after_id)
+            except tk.TclError:
+                pass
+            self._play_after_id = None
+
+    def _advance_playhead(self):
+        """Move the playhead to where the audio is now; False once it ended."""
+        clock0, t0 = self._play_anchor
+        t = t0 + (time.monotonic() - clock0) * self._play_speed
+        if t >= self._play_end:
+            return False
+        self._play_pos = t
+        return True
+
+    def _play_tick(self):
+        self._play_after_id = None
+        if not self._playing:
+            return
+        if not self._advance_playhead():
+            # Reached the end of the window: rewind, like a player would.
+            self._halt_play_tracking()
+            self._play_pos = None
+            self._refresh_transport()
+            return
+        self._refresh_transport()
+        try:
+            self._play_after_id = self.root.after(30, self._play_tick)
+        except tk.TclError:          # window closed mid-play
+            self._playing = False
+
+    def _on_seek(self, value):
+        if self._seek_syncing or getattr(self, "audio", None) is None:
+            return
+        self._play_pos = float(value)
+        if self._playing:
+            self.start_playback()
+        else:
+            self._refresh_transport()
+
+    # ── Playhead drawing ─────────────────────────────────
+    # The lines are "animated" artists: a normal canvas.draw() leaves them
+    # out, and while playing only they are blitted over a saved copy of the
+    # figure, so the spectrogram is not re-rendered 30 times a second.
+
+    def _create_playhead_lines(self):
+        self._playhead_lines = [
+            ax.axvline(0, color='#d500f9', linewidth=2.5, animated=True,
+                       visible=False)
+            for ax in (self.ax_spec, self.ax_entropy, self.ax_noise)
+        ]
+
+    def _position_playhead_lines(self):
+        w_start, w_end = self._window_bounds()
+        pos = self._play_pos
+        show = pos is not None and w_start <= pos <= w_end
+        for line in self._playhead_lines:
+            line.set_visible(show)
+            if show:
+                line.set_xdata([pos, pos])
+
+    def _draw_playhead_lines(self):
+        for line in self._playhead_lines:
+            if line.get_visible():
+                line.axes.draw_artist(line)
+
+    def _on_canvas_draw(self, event):
+        self._blit_background = self.canvas.copy_from_bbox(self.fig.bbox)
+        self._position_playhead_lines()
+        self._draw_playhead_lines()
+
+    def _refresh_transport(self):
+        """Sync the play button, time readout, seek bar and playhead."""
+        try:
+            self.btn_play_pause.config(
+                text="⏸ Pause" if self._playing else "▶ Play")
+            if getattr(self, "audio", None) is None or not self.fs:
+                self.lbl_play_time.config(text="")
+                return
+            w_start, w_end = self._window_bounds()
+            total = len(self.audio) / self.fs
+            pos = self._play_pos if self._play_pos is not None else w_start
+            self.lbl_play_time.config(text=f"{pos:7.3f} s / {total:.2f} s")
+            self._seek_syncing = True
+            try:
+                self.seek_scale.config(from_=w_start, to=max(w_end, w_start + 1e-6))
+                self.seek_var.set(pos)
+            finally:
+                self._seek_syncing = False
+        except tk.TclError:          # window already destroyed
+            return
+        if self._blit_background is None:
+            return
+        self._position_playhead_lines()
+        self.canvas.restore_region(self._blit_background)
+        self._draw_playhead_lines()
+        self.canvas.blit(self.fig.bbox)
+
+    # ── Volume ───────────────────────────────────────────
+
+    def _update_volume_label(self):
+        self.lbl_volume.config(text=f"{self.volume_var.get():.0f}%")
+
+    def _on_volume_changed(self, _value=None):
+        self._update_volume_label()
+        # Dragging fires this per pixel; write the settings file once the
+        # slider settles.
+        if self._volume_save_id is not None:
+            self.root.after_cancel(self._volume_save_id)
+        self._volume_save_id = self.root.after(400, self._save_volume)
+
+    def _save_volume(self):
+        self._volume_save_id = None
+        _save_setting("playback_volume_percent", round(self.volume_var.get()))
+
+    def _apply_volume_to_current_play(self, _event=None):
+        """The level is baked in when a sound starts; on slider release,
+        restart the window from the playhead so the change is heard now."""
+        if self._playing:
+            self.pause_playback()
+            self.start_playback()
+
+    def _on_auto_level_toggled(self):
+        _save_setting("playback_auto_level", bool(self.auto_level_var.get()))
+        self._apply_volume_to_current_play()
 
     def set_slowmo_speed(self):
         new_speed = simpledialog.askfloat(
@@ -1497,13 +1826,6 @@ class IntegratedSpectrogramViewer:
     # Playback & plotting
     # ================================================================
 
-    def play_current_window(self):
-        start_sample = int(self.current_window_start * self.fs)
-        end_sample = int((self.current_window_start + self.window_duration) * self.fs)
-        segment = self.audio[start_sample:end_sample]
-        sd.stop()
-        sd.play(segment, self.fs)
-
     def update_plots(self):
         window_start = self.current_window_start
         window_end = window_start + self.window_duration
@@ -1610,8 +1932,19 @@ class IntegratedSpectrogramViewer:
             step = max(1, len(noise_seg) // 4000)
             self.ax_noise.plot(t_noise[::step], noise_seg[::step],
                                color='orange', linewidth=0.8)
+
+        # A playhead the new window no longer shows is dropped, and so is
+        # the sound it was tracking.
+        if self._play_pos is not None and not (
+                window_start <= self._play_pos <= window_end):
+            if self._playing:
+                sd.stop()
+                self._halt_play_tracking()
+            self._play_pos = None
+        self._create_playhead_lines()
         self.fig.tight_layout()
         self.canvas.draw()
+        self._refresh_transport()
 
     def move_window(self, direction):
         step = self.window_duration * 0.25
@@ -2353,8 +2686,12 @@ class IntegratedSpectrogramViewer:
             print(f"Could not load template audio: {e}")
             return None
 
-    def _safe_play(self, data, samplerate):
-        """Play audio, falling back to a working output device.
+    def _safe_play(self, data, samplerate, ref_peak=None):
+        """Play audio at the user's volume, falling back to a working
+        output device.
+
+        Anything played here replaces what was playing, so the window
+        playhead stops following it (start_playback restarts it after).
 
         On macOS, Bluetooth devices like AirPods intermittently fail to open
         an output stream (PortAudio internal error ``-9986``) when they are
@@ -2362,6 +2699,11 @@ class IntegratedSpectrogramViewer:
         first real output device (typically the built-in speakers) before
         giving up.
         """
+        self._halt_play_tracking()
+        self._refresh_transport()
+        data = playback_signal(data, volume=self.volume_var.get() / 100.0,
+                               auto_level=self.auto_level_var.get(),
+                               ref_peak=ref_peak)
         try:
             sd.stop()
             sd.play(data, samplerate)
@@ -2379,11 +2721,11 @@ class IntegratedSpectrogramViewer:
                     continue
             raise first_err
 
-    def _play_audio_segment(self, data, fs, speed=1.0):
+    def _play_audio_segment(self, data, fs, speed=1.0, ref_peak=None):
         """Play an in-memory audio segment.  ``speed`` < 1.0 lowers the output
         sample rate for slow-motion playback."""
         try:
-            self._safe_play(data, int(fs * speed))
+            self._safe_play(data, int(fs * speed), ref_peak=ref_peak)
         except Exception as e:
             messagebox.showerror("Error",
                                  f"Could not play template audio: {e}")
@@ -2409,8 +2751,12 @@ class IntegratedSpectrogramViewer:
                            noise_audio=None):
         b, a = butter(N=4, Wn=1000 / (fs / 2), btype='highpass')
         y_hp = filtfilt(b, a, y)  # noqa: F841  # computed but original used
+        if self._playing:
+            self.stop_playback()
+        self._play_pos = None
         self.audio = y
         self.fs = fs
+        self._audio_peak = float(np.max(np.abs(y))) if len(y) else None
         self.wav_filename = file
         # Belongs to the song that just closed, not to this one.
         self._scoring_spectrogram = None
@@ -2834,7 +3180,8 @@ class IntegratedSpectrogramViewer:
             i1 = min(len(self.audio), int(t_end * self.fs))
             if i1 > i0:
                 self._play_audio_segment(np.asarray(self.audio[i0:i1]),
-                                         self.fs, speed=speed)
+                                         self.fs, speed=speed,
+                                         ref_peak=self._audio_peak)
 
         play_frame = tk.Frame(top)
         play_frame.pack(fill='x', padx=5)
