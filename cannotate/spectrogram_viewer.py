@@ -214,6 +214,31 @@ def _is_unlabeled_label(label):
         return str(label) == "999"
 
 
+# The main viewer draws its spectrogram with this colormap, percentile-clipped
+# to these bounds.  Template previews reuse both so a syllable looks the same
+# in the viewer, the template window and the suggestion popup.
+SPEC_CMAP = 'gray_r'
+SPEC_PERCENTILES = (5, 96)
+
+
+def _imshow_like_viewer(ax, spec, percentiles=SPEC_PERCENTILES, **kwargs):
+    """Draw *spec* with the viewer's colormap and percentile contrast.
+
+    The data is passed through unchanged; only the colour limits are set, so
+    a patch on any scale (the viewer's [0, 1] image or a bank template) gets
+    the same look as the main spectrogram.
+    """
+    spec = np.asarray(spec)
+    finite = spec[np.isfinite(spec)]
+    vmin = vmax = None
+    if finite.size:
+        vmin, vmax = np.percentile(finite, percentiles)
+        if not vmax > vmin:
+            vmin, vmax = None, None
+    return ax.imshow(spec, aspect='auto', origin='lower', cmap=SPEC_CMAP,
+                     vmin=vmin, vmax=vmax, **kwargs)
+
+
 def _write_png_template(annot_id, tmpl, template_dir, palette):
     """Write ``syllable_{annot_id}.png`` from a template's spectrogram.
 
@@ -230,7 +255,7 @@ def _write_png_template(annot_id, tmpl, template_dir, palette):
     png_path = os.path.join(template_dir, f"syllable_{annot_id}.png")
     try:
         fig_tmpl, ax_tmpl = plt.subplots(figsize=(4, 3), dpi=100)
-        ax_tmpl.imshow(spec, aspect='auto', origin='lower', cmap='inferno')
+        _imshow_like_viewer(ax_tmpl, spec)
         ax_tmpl.set_title(f"Syllable {annot_id} Template", color=color)
         ax_tmpl.set_xlabel("Time (s)")
         ax_tmpl.tick_params(axis='y', which='both', left=False, labelleft=False)
@@ -603,8 +628,7 @@ class IntegratedSpectrogramViewer:
         self.T = None
         self.F = None
         self.nfft = 512
-        self.percentile_low = 5
-        self.percentile_high = 96
+        self.percentile_low, self.percentile_high = SPEC_PERCENTILES
         self.segments = []
         self.segment_start = None
         self.palette = distinguishable_colors(1000)
@@ -1840,7 +1864,7 @@ class IntegratedSpectrogramViewer:
         self.ax_spec.imshow(S_norm_crop, aspect='auto', origin='lower',
                             extent=[window_start, window_end,
                                     self.F[0], self.F[-1]],
-                            cmap='gray_r', vmin=0, vmax=1)
+                            cmap=SPEC_CMAP, vmin=0, vmax=1)
         self.ax_spec.set_ylabel("Frequency (Hz)")
         self.ax_spec.set_xticklabels([])
 
@@ -2542,7 +2566,7 @@ class IntegratedSpectrogramViewer:
                 fig_tmpl, ax_tmpl = plt.subplots(figsize=(4, 3), dpi=100)
                 extent = [cropped_T[0], cropped_T[-1], self.F[0], self.F[-1]]
                 ax_tmpl.imshow(cropped_S, aspect='auto', origin='lower',
-                               extent=extent, cmap='inferno')
+                               extent=extent, cmap=SPEC_CMAP, vmin=0, vmax=1)
                 ax_tmpl.set_title(f"Syllable {annot} Template", color=color)
                 ax_tmpl.set_xlabel("Time (s)")
                 ax_tmpl.tick_params(axis='y', which='both',
@@ -2631,7 +2655,8 @@ class IntegratedSpectrogramViewer:
             color = "black"
         fig = plt.Figure(figsize=(4, 3), dpi=100)
         ax = fig.add_subplot(111)
-        ax.imshow(spec, aspect='auto', origin='lower', cmap='inferno')
+        _imshow_like_viewer(ax, spec,
+                            (self.percentile_low, self.percentile_high))
         ax.set_title(f"Syllable {syllable_number} Template", color=color)
         ax.tick_params(axis='both', labelsize=7)
         fig.tight_layout()
@@ -3090,7 +3115,8 @@ class IntegratedSpectrogramViewer:
         fig_q = plt.Figure(figsize=(6, 1.5), dpi=100)
         ax_q = fig_q.add_subplot(111)
         if query_spec is not None:
-            ax_q.imshow(query_spec, aspect='auto', origin='lower', cmap='inferno')
+            _imshow_like_viewer(ax_q, query_spec,
+                                (self.percentile_low, self.percentile_high))
         ax_q.set_title(f"Query  [{t_start:.3f}s – {t_end:.3f}s]", fontsize=10)
         ax_q.tick_params(axis='both', labelsize=7)
         fig_q.tight_layout()
@@ -3135,7 +3161,8 @@ class IntegratedSpectrogramViewer:
             if tmpl_data is not None:
                 tmpl_spec = tmpl_data["spec"] if isinstance(tmpl_data, dict) else tmpl_data
                 color = self.palette[annot_id - 1]
-                ax_t.imshow(tmpl_spec, aspect='auto', origin='lower', cmap='inferno')
+                _imshow_like_viewer(ax_t, tmpl_spec,
+                                    (self.percentile_low, self.percentile_high))
                 ax_t.set_title(f"Template – Syllable {annot_id}",
                                fontsize=10, color=color)
             else:

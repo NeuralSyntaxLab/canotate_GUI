@@ -234,6 +234,11 @@ def merge_json_files(json_file_1, json_file_2, output_file):
     return new_annotated_files
 
 
+# Labels with a special meaning that alignment never rewrites, even when the
+# master doesn't use them.
+SPECIAL_LABELS = frozenset({111})
+
+
 def _segment_overlap(seg_a, seg_b):
     """Length of the time overlap between two [start, end, ...] segments (0 if disjoint)."""
     return max(0.0, min(seg_a[1], seg_b[1]) - max(seg_a[0], seg_b[0]))
@@ -253,6 +258,7 @@ def _align_merged_annotations_to_master(dataset_0, dataset_1):
       - otherwise it takes the most frequent master label among all the
         matches of that label.
     Labels with no overlapping master segment anywhere are left unchanged.
+    Special labels (SPECIAL_LABELS, e.g. 111) are never rewritten.
 
     Parameters:
     dataset_0 (dict): master annotation (not modified).
@@ -262,7 +268,7 @@ def _align_merged_annotations_to_master(dataset_0, dataset_1):
     dict: a copy of dataset_1 with the merged-away labels rewritten.
     """
     master_labels = set(count_label_classes(dataset_0))
-    removed_labels = set(count_label_classes(dataset_1)) - master_labels
+    removed_labels = set(count_label_classes(dataset_1)) - master_labels - SPECIAL_LABELS
     if not removed_labels:
         return dataset_1
 
@@ -678,10 +684,10 @@ def get_unique_wav_paths(json_1, json_2):
 
 if __name__=="__main__":
     # Example usage
-    json_file_0 = '/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged_1910.json'
-    json_file_1 = '/Users/nitzankarby/Downloads/LY10RB_annotation_talgr_annotation_merged_2310.json'
-    output = '/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged_2310.json'
-    # # merge_json_files(json_file_0, json_file_1, output)
+    json_file_0 = '/Volumes/Extreme Pro/RO/RO_phrase_level.json'
+    json_file_1 = '/Users/nitzankarby/Desktop/masters/yarden cohen/dev/behavioral_experiment_syntax_manipulation/RO_auto_1711-2111.json'
+    output = '/Volumes/Extreme Pro/RO/RO_phrase_level.json'
+    # merge_json_files(json_file_0, json_file_1, output)
 
     # print(len(get_unique_wav_paths('/Volumes/Extreme Pro/LY10RB/LY10RB_annotation_talgr_annotation_merged.json', "/Users/nitzankarby/Downloads/LY10RB_annotation_talgr_annotation_merged.json")))
     new_annotations = merge_json_files(json_file_0, json_file_1, output)
